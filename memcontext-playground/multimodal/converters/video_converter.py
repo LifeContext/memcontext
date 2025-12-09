@@ -245,20 +245,28 @@ class VideoConverter(MultimodalConverter):
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"视频文件不存在: {video_path}")
         self._report_progress(0.1, f"正在获取视频时长: {os.path.basename(video_path)}...")
+        # 仅依赖 ffprobe 获取时长，避免 OpenCV 依赖
+        if not shutil.which("ffprobe"):
+            self._report_progress(0.15, "未找到 ffprobe，无法获取视频时长")
+            return None
+
         try:
-            import cv2
-            cap = cv2.VideoCapture(video_path)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            duration = frame_count / fps if fps > 0 else None
-            cap.release()
-            if duration is not None:
-                self._report_progress(0.15, f"视频时长: {duration:.2f} 秒")
-                return duration
-        except ImportError:
-            pass
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                duration = float(result.stdout.strip())
+                if duration > 0:
+                    self._report_progress(0.15, f"视频时长: {duration:.2f} 秒")
+                    return duration
         except Exception:
             pass
+
         return None
     
     def _get_audio_duration(self, audio_path: str) -> Optional[float]:

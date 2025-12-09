@@ -63,9 +63,15 @@ class Updater:
         return page_data
 
     def _get_embedding_for_page(self, text):
-        """获取页面embedding的辅助方法"""
+        """获取页面embedding的辅助方法，复用 mid_term_memory 的 embedding 配置"""
         from .utils import get_embedding
-        return get_embedding(text)
+        model_name = getattr(self.mid_term_memory, "embedding_model_name", "all-MiniLM-L6-v2")
+        model_kwargs = getattr(self.mid_term_memory, "embedding_model_kwargs", {}) or {}
+        return get_embedding(
+            text,
+            model_name=model_name,
+            **model_kwargs
+        )
 
     def _update_linked_pages_meta_info(self, start_page_id, new_meta_info):
         """
