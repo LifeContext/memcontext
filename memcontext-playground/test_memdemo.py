@@ -7,17 +7,17 @@
 import json
 import pathlib
 import requests
-
+import os
 SERVER = "http://127.0.0.1:5019"
 SESSION_INIT_ENDPOINT = f"{SERVER}/init_memory"
 ADD_MM_ENDPOINT = f"{SERVER}/add_multimodal_memory"
 
 def init_memory(session):
     payload = {
-        "user_id": "video_user",
-        "api_key": os.environ.get("OPENAI_API_KEY", ""),
-        "base_url": "https://api.openai.com/v1",
-        "model_name": "gpt-4o-mini",
+        "user_id": "video_user2",
+        "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+        "base_url": "https://api.deepseek.com/v1",
+        "model_name": "deepseek-chat",
         "siliconflow_key": os.environ.get("SILICONFLOW_API_KEY", ""),
     }
     resp = session.post(SESSION_INIT_ENDPOINT, json=payload, timeout=60)
@@ -29,7 +29,7 @@ def init_memory(session):
 
 def add_video(session, video_path):
     payload = {
-        "converter_type": "video",
+        "converter_type": "videorag",
         # 若想自定义 VideoRAG 参数，可在此 JSON 中补充
         "converter_kwargs": json.dumps({
             "working_dir": "./videorag-workdir",
@@ -45,7 +45,7 @@ def add_video(session, video_path):
         ADD_MM_ENDPOINT,
         data=payload,
         files=files,
-        timeout=2400,  # VideoRAG 处理较耗时
+        timeout=24000,  # VideoRAG 处理较耗时
     )
     print(resp.text)
     resp.raise_for_status()
@@ -56,7 +56,7 @@ def main():
     session_id = init_memory(session)
     print(f"Session ready: {session_id}")
 
-    result = add_video(session=session, video_path="/root/repo/memcontext/test4.mp4")
+    result = add_video(session=session, video_path="/root/repo/uni-mem/files/test_video.mp4")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":

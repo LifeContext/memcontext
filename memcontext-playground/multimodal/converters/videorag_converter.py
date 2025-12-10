@@ -69,11 +69,10 @@ class VideoConverter(MultimodalConverter):
         videorag = VideoRAG(llm=llm_config, **videorag_params)
 
         self._report_progress(0.05, "准备视频处理流程")
-        self._ingest_video_with_progress(videorag, str(video_path))
+        segments = self._ingest_video_with_progress(videorag, str(video_path))
 
         self._report_progress(0.78, "汇总 VideoRAG 片段结果")
         video_name = video_path.stem
-        segments = videorag.video_segments._data.get(video_name)
         if not segments:
             return ConversionOutput(
                 status="failed",
@@ -198,14 +197,14 @@ class VideoConverter(MultimodalConverter):
             },
         )
 
-    def _ingest_video_with_progress(self, videorag: VideoRAG, video_path: str) -> None:
+    def _ingest_video_with_progress(self, videorag: VideoRAG, video_path: str) -> Dict[str, Dict[str, Any]]:
         loop = always_get_an_event_loop()
         video_name = Path(video_path).stem
         if video_name in videorag.video_segments._data:
             stored_path = videorag.video_path_db._data.get(video_name)
             if stored_path and os.path.exists(stored_path):
                 self._report_progress(0.7, f"视频 {video_name} 已存在，跳过重建")
-                return
+                return videorag.video_segments._data.get(video_name, {})
             # 已有索引但原视频文件不存在，更新路径为本次提供的文件
             loop.run_until_complete(videorag.video_path_db.upsert({video_name: video_path}))
             self._report_progress(0.09, f"视频 {video_name} 重新绑定路径")
@@ -282,25 +281,9 @@ class VideoConverter(MultimodalConverter):
         )
         manager.shutdown()
 
-        loop.run_until_complete(videorag.video_segments.upsert({video_name: segments_information}))
-        self._report_progress(0.55, "写入视频分段缓存")
+        # 直接返回片段信息，跳过embedding和持久化步骤
+        return segments_information
 
-        self._report_progress(0.62, "编码视频特征向量")
-        loop.run_until_complete(
-            videorag.video_segment_feature_vdb.upsert(
-                video_name,
-                segment_index2name,
-                videorag.video_output_format,
-            )
-        )
 
-        cache_path = Path(videorag.working_dir) / "_cache" / video_name
-        if cache_path.exists():
-            shutil.rmtree(cache_path)
-
-        loop.run_until_complete(videorag._save_video_segments())
-        self._report_progress(0.68, "持久化视频分段")
-
-        self._report_progress(0.7, "更新多模态索引")
-        loop.run_until_complete(videorag.ainsert(videorag.video_segments._data))
+ConverterFactory.register("videorag", VideoConverter, priority=0)
 

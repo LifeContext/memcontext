@@ -21,7 +21,8 @@ try:
     from .long_term import LongTermMemory
     from .updater import Updater
     from .retriever import Retriever
-    from .multimodal import ConverterFactory
+from .multimodal import ConverterFactory
+from .multimodal.converter import ConversionChunk, ConversionOutput
     from .multimodal.utils import guess_file_extension, guess_mime_type, compute_file_hash
 except ImportError:
     # 回退到绝对导入（当作为独立模块使用时）
@@ -55,7 +56,7 @@ class Memcontext:
                  short_term_capacity=10,
                  mid_term_capacity=2000,
                  long_term_knowledge_capacity=100,
-                 retrieval_queue_capacity=7,
+                 retrieval_queue_capacity=4,
                  mid_term_heat_threshold=H_PROFILE_UPDATE_THRESHOLD,
                  mid_term_similarity_threshold=0.6,
                  llm_model="gpt-4o-mini",
@@ -269,6 +270,121 @@ class Memcontext:
         # After any memory addition that might impact mid-term, check for profile updates
         self._trigger_profile_and_knowledge_update_if_needed()
 
+    def add_memories_batch(self, memories: List[Dict[str, Any]], skip_short_term: bool = False):
+        """
+        批量添加多条记忆，优化大量内容的存储效率。
+        
+        Args:
+            memories: 记忆列表，每个元素包含 user_input, agent_response, timestamp, meta_data
+            skip_short_term: 如果为 True，直接批量添加到 mid_term，跳过 short_term
+        """
+        if not memories:
+            return
+        
+        print(f"Memorycontext: Batch adding {len(memories)} memories (skip_short_term={skip_short_term})")
+        
+        if skip_short_term:
+            # 直接批量添加到 mid_term，跳过 short_term
+            # 这样可以避免频繁的 short_term -> mid_term 转换
+            # 使用和文件顶部相同的导入策略
+            try:
+                from .utils import check_conversation_continuity, generate_page_meta_info, gpt_generate_multi_summary
+            except ImportError:
+                from utils import check_conversation_continuity, generate_page_meta_info, gpt_generate_multi_summary
+            
+            # get_timestamp 和 generate_id 已经在文件顶部导入了，直接使用
+            
+            # 准备页面数据
+            pages_to_insert = []
+            temp_last_page = None
+            
+            for mem in memories:
+                if not mem.get("user_input") or not mem.get("agent_response"):
+                    continue
+                
+                page_obj = {
+                    "page_id": generate_id("page"),
+                    "user_input": mem.get("user_input", ""),
+                    "agent_response": mem.get("agent_response", ""),
+                    "timestamp": mem.get("timestamp", get_timestamp()),
+                    "preloaded": False,
+                    "analyzed": False,
+                    "pre_page": None,
+                    "next_page": None,
+                    "meta_info": None
+                }
+                
+                # 检查连续性
+                is_continuous = check_conversation_continuity(
+                    temp_last_page, page_obj, self.client, model=self.llm_model
+                )
+                
+                if is_continuous and temp_last_page:
+                    page_obj["pre_page"] = temp_last_page["page_id"]
+                    last_meta = temp_last_page.get("meta_info")
+                    new_meta = generate_page_meta_info(last_meta, page_obj, self.client, model=self.llm_model)
+                    page_obj["meta_info"] = new_meta
+                else:
+                    page_obj["meta_info"] = generate_page_meta_info(None, page_obj, self.client, model=self.llm_model)
+                
+                pages_to_insert.append(page_obj)
+                temp_last_page = page_obj
+            
+            if not pages_to_insert:
+                return
+            
+            # 生成批量摘要
+            input_text_for_summary = "\n".join([
+                f"User: {p.get('user_input','')}\nAssistant: {p.get('agent_response','')}" 
+                for p in pages_to_insert
+            ])
+            
+            print(f"Memorycontext: Generating multi-topic summary for {len(pages_to_insert)} pages...")
+            multi_summary_result = gpt_generate_multi_summary(
+                input_text_for_summary, self.client, model=self.llm_model
+            )
+            
+            # 插入到 mid_term
+            if multi_summary_result and multi_summary_result.get("summaries"):
+                for summary_item in multi_summary_result["summaries"]:
+                    theme_summary = summary_item.get("content", "General summary of recent interactions.")
+                    theme_keywords = summary_item.get("keywords", [])
+                    self.mid_term_memory.insert_pages_into_session(
+                        summary_for_new_pages=theme_summary,
+                        keywords_for_new_pages=theme_keywords,
+                        pages_to_insert=pages_to_insert,
+                        similarity_threshold=self.mid_term_similarity_threshold
+                    )
+            else:
+                # Fallback
+                fallback_summary = "Batch of memories from multimodal content ingestion."
+                self.mid_term_memory.insert_pages_into_session(
+                    summary_for_new_pages=fallback_summary,
+                    keywords_for_new_pages=[],
+                    pages_to_insert=pages_to_insert,
+                    similarity_threshold=self.mid_term_similarity_threshold
+                )
+            
+            # 更新页面连接
+            for page in pages_to_insert:
+                if page.get("pre_page"):
+                    self.mid_term_memory.update_page_connections(page["pre_page"], page["page_id"])
+            
+            self.mid_term_memory.save()
+            print(f"Memorycontext: Successfully batch added {len(pages_to_insert)} memories to mid-term.")
+            
+            # 检查是否需要触发 profile 更新
+            self._trigger_profile_and_knowledge_update_if_needed()
+        else:
+            # 使用原来的方式，逐个添加到 short_term
+            for mem in memories:
+                self.add_memory(
+                    user_input=mem.get("user_input", ""),
+                    agent_response=mem.get("agent_response", ""),
+                    timestamp=mem.get("timestamp"),
+                    meta_data=mem.get("meta_data")
+                )
+
     def get_response(self, query: str, relationship_with_user="friend", style_hint="", user_conversation_meta_data: dict = None) -> str:
         """
         Generates a response to the user's query, incorporating memory and context.
@@ -430,13 +546,66 @@ class Memcontext:
             }
 
         base_metadata = self._build_multimodal_metadata(item, source_type, file_path, file_extension, mime_type)
-        output = converter.convert(
-            item,
-            source_type=source_type,
-        )
-        output.ensure_chunks()
+
+        # --- Temp cache: avoid重复解析同一文件 ---
+        cache_dir = Path(self.data_storage_path) / "temp_memory"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        file_id = base_metadata.get("source_file_id")
+        cache_file = cache_dir / f"{file_id}.json" if file_id else None
+
+        output = None
+        if cache_file and cache_file.exists():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                cached_chunks = []
+                for idx, ch in enumerate(cached.get("chunks", [])):
+                    meta = ch.get("metadata", {}) or {}
+                    chunk_idx = meta.get("chunk_index", idx)
+                    cached_chunks.append(
+                        ConversionChunk(
+                            text=ch.get("text", ""),
+                            chunk_index=chunk_idx,
+                            metadata=meta,
+                        )
+                    )
+                output = ConversionOutput(
+                    status="success",
+                    text="\n\n".join(c.text for c in cached_chunks),
+                    chunks=cached_chunks,
+                    metadata=cached.get("metadata", {}),
+                )
+                output.ensure_chunks()
+                print(f"Memorycontext: Loaded cached conversion for file_id={file_id}")
+            except Exception as e:
+                print(f"Memorycontext: Failed to load cache for file_id={file_id}, will re-run conversion. Error: {e}")
+                output = None
+
+        if output is None:
+            output = converter.convert(
+                item,
+                source_type=source_type,
+            )
+            output.ensure_chunks()
+            # 写入缓存，便于同一文件再次导入时直接复用
+            if cache_file:
+                try:
+                    cache_payload = {
+                        "metadata": output.metadata,
+                        "chunks": [
+                            {"text": ch.text, "metadata": ch.metadata}
+                            for ch in output.chunks
+                        ],
+                    }
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        json.dump(cache_payload, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"Memorycontext: Failed to write cache for file_id={file_id}, skip caching. Error: {e}")
 
         timestamps = []
+        
+        # 准备所有记忆数据
+        memories_to_add = []
         for chunk in output.chunks:
             chunk_meta = {
                 **base_metadata,
@@ -448,12 +617,56 @@ class Memcontext:
                 "chunk_summary",
                 f"[Multimodal] Stored content from {chunk_meta.get('original_filename', 'file')}",
             )
-            self.add_memory(
-                user_input=chunk.text,
-                agent_response=chunk_agent_response,
-                meta_data=chunk_meta,
-            )
+            
+            # 对于视频内容，构建格式化的 user_input
+            video_path = chunk_meta.get("video_path") or chunk_meta.get("original_filename", "视频")
+            time_range = chunk_meta.get("time_range", "")
+            
+            # 如果是视频内容（通过 video_path 或 time_range 判断）且有 time_range，使用新格式
+            if (chunk_meta.get("video_path") or chunk_meta.get("video_name")) and time_range:
+                user_input = f"描述{video_path}视频的{time_range}的内容"
+            else:
+                # 非视频内容或没有 time_range，使用原来的格式
+                user_input = chunk.text
+            
+            memories_to_add.append({
+                "user_input": user_input,
+                "agent_response": chunk_agent_response,
+                "timestamp": get_timestamp(),
+                "meta_data": chunk_meta,
+            })
             timestamps.append(get_timestamp())
+        
+        # 如果记忆数量超过 short_term 容量：
+        #  - 多余部分直接批量写入 mid_term（跳过 short_term）
+        #  - 保留最后 short_term 容量（默认 7 条）在 short_term，便于后续对话快速命中
+        cap = self.short_term_memory.max_capacity
+        if len(memories_to_add) > cap:
+            bulk_to_mid = memories_to_add[:-cap]  # 超出容量的部分
+            tail_to_st = memories_to_add[-cap:]   # 保留在 short_term 的部分
+
+            if bulk_to_mid:
+                print(f"Memorycontext: Large batch detected ({len(memories_to_add)} items). "
+                      f"Sending {len(bulk_to_mid)} to mid-term (skip short-term) and keeping {len(tail_to_st)} in short-term.")
+                self.add_memories_batch(bulk_to_mid, skip_short_term=True)
+
+            # 将尾部 cap 条写入 short_term
+            for mem in tail_to_st:
+                self.add_memory(
+                    user_input=mem["user_input"],
+                    agent_response=mem["agent_response"],
+                    timestamp=mem["timestamp"],
+                    meta_data=mem["meta_data"]
+                )
+        else:
+            # 少量内容，使用原来的方式逐个添加
+            for mem in memories_to_add:
+                self.add_memory(
+                    user_input=mem["user_input"],
+                    agent_response=mem["agent_response"],
+                    timestamp=mem["timestamp"],
+                    meta_data=mem["meta_data"]
+                )
 
         return {
             "status": output.status,

@@ -552,20 +552,20 @@
                                         <label for="apiKey" class="form-label">OpenAI API Key</label>
                                         <input type="password" class="form-control" id="apiKey" 
                                                placeholder="Enter your OpenAI API Key" required>
-                                        <div class="form-text">🔑 Your OpenAI API Key</div>
+                                        <div class="form-text">🔑 API Key</div>
                                     </div>
                                 </div>
                                 <div class="col-md-6">
                                     <div class="mb-3">
                                         <label for="modelName" class="form-label">Model</label>
                                         <input type="text" class="form-control" id="modelName" 
-                                               placeholder="e.g., gpt-4o-mini" value="gpt-4o-mini" required>
+                                               placeholder="e.g., deepseek-chat" value="deepseek-chat">
                                         <div class="form-text">🤖 AI model to use</div>
                                     </div>
                                     <div class="mb-3">
                                         <label for="baseUrl" class="form-label">API Base URL</label>
                                         <input type="text" class="form-control" id="baseUrl" 
-                                               placeholder="e.g., https://api.openai.com/v1" value="https://api.openai.com/v1" required>
+                                               placeholder="留空使用默认: https://api.deepseek.com/v1" value="https://api.deepseek.com/v1">
                                         <div class="form-text">🌐 API endpoint URL</div>
                                     </div>
                                 </div>
@@ -951,7 +951,7 @@
                 return;
             }
             if (!apiKey) {
-                alert('请输入 OpenAI API Key');
+                alert('请输入 API Key');
                 return;
             }
             if (!baseUrl) {

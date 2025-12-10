@@ -16,8 +16,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from memcontext import Memcontext
 # Import utils directly from the playground directory
 from utils import get_timestamp
-from multimodal.converters.video_converter import VideoConverter
-from multimodal.converters.videorag_converter import VideoConverter as VideoRAGConverter
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -75,24 +73,20 @@ def init_memory():
     api_key = data.get('api_key', '').strip()
     base_url = data.get('base_url', '').strip()
     model = data.get('model_name', '').strip()
-    siliconflow_key = data.get('siliconflow_key', '').strip()
+    # 不再自动启用 SiliconFlow，避免远程 embedding 403
+    siliconflow_key = ""
 
-    if not user_id or not api_key or not base_url or not model:
-        return jsonify({'error': 'User ID, API Key, Base URL, and Model Name are required.'}), 400
+    # 默认使用 DeepSeek API
+    if not base_url:
+        base_url = "https://api.deepseek.com/v1"
+    if not model:
+        model = "deepseek-chat"
+
+    if not user_id or not api_key:
+        return jsonify({'error': 'User ID 和 API Key 是必需的。Base URL 和 Model Name 如果不提供，将默认使用 DeepSeek API。'}), 400
     
     assistant_id = f"assistant_{user_id}"
-    embedding_kwargs = {}
-    if siliconflow_key:
-        os.environ['SILICONFLOW_API_KEY'] = siliconflow_key
-        embedding_kwargs = {
-            'use_siliconflow': True,
-            'siliconflow_model': "BAAI/bge-m3"
-        }
-    elif os.environ.get('SILICONFLOW_API_KEY'):
-        embedding_kwargs = {
-            'use_siliconflow': True,
-            'siliconflow_model': "BAAI/bge-m3"
-        }
+    embedding_kwargs = {}  # 强制使用本地/默认 embedding，避免调用 siliconflow
     
     try:
         # Initialize memcontext for this session
@@ -105,13 +99,12 @@ def init_memory():
             openai_base_url=base_url,
             data_storage_path=data_path,
             assistant_id=assistant_id,  # 使用邀请码作为assistant_id
-            short_term_capacity=15,  # Smaller for demo
+            short_term_capacity=7,  # Smaller for demo
             mid_term_capacity=200,   # Smaller for demo
             long_term_knowledge_capacity=1000,  # Smaller for demo
             mid_term_heat_threshold=10.0,
-            # embedding_model_name="/root/autodl-tmp/embedding_cache/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181",  # 降低阈值，更容易触发长期记忆更新（原默认值为5.0）
-            embedding_model_name="BAAI/bge-m3",  # 使用模型名称，会自动下载或远程请求
-            embedding_model_kwargs=embedding_kwargs,
+            embedding_model_name="all-MiniLM-L6-v2",  # 使用本地/默认 embedding，避免远程请求
+            embedding_model_kwargs=embedding_kwargs,  # 空字典表示不使用 siliconflow
             llm_model=model
         )
         
@@ -214,7 +207,7 @@ def add_multimodal_memory_endpoint():
         if source_type != 'file_path':
             return jsonify({'error': '当前仅支持本地文件路径(file_path)的视频源'}), 400
 
-        converter_type = (converter_type or 'video').lower()
+        converter_type = (converter_type or 'videorag').lower()
         if converter_type not in ('video', 'videorag'):
             return jsonify({'error': f'不支持的 converter_type: {converter_type}，可选 video | videorag'}), 400
 
@@ -234,85 +227,37 @@ def add_multimodal_memory_endpoint():
                 'progress': round(float(progress), 4),
                 'message': message
             })
-        print(converter_settings)
-        print(f"progress_callback: {progress_callback}")
 
-        if converter_type == 'videorag':
-            converter = VideoRAGConverter(progress_callback=progress_callback, **converter_settings)
-        else:
-            converter = VideoConverter(progress_callback=progress_callback, **converter_settings)
+        # 使用 memory_system.add_multimodal_memory() 方法，它会自动处理所有chunks并存储到记忆中
+        try:
+            result = memory_system.add_multimodal_memory(
+                source=source,
+                source_type=source_type,
+                converter_type=converter_type,
+                agent_response=agent_response,
+                converter_kwargs=converter_settings,
+                progress_callback=progress_callback,
+            )
+            
+            if result.get('status') != 'success':
+                return jsonify({
+                    'error': result.get('error', '处理失败'),
+                    'metadata': result,
+                    'progress': progress_events
+                }), 500
 
-        print(f"converter: {converter}")
-        video_result = converter.convert(
-            source,
-            source_type='file_path',
-            **converter_settings,
-        )
-        print(f"video_result: {video_result}")
-        if video_result.status != 'success':
             return jsonify({
-                'error': video_result.error or 'VideoRAG 处理失败',
-                'metadata': video_result.metadata,
+                'success': True,
+                'ingested_rounds': result.get('chunks_written', 0),
+                'file_id': result.get('file_id'),
+                'timestamps': result.get('timestamps', []),
+                'progress': progress_events
+            })
+        except Exception as e:
+            return jsonify({
+                'error': f'调用 add_multimodal_memory 失败: {str(e)}',
                 'progress': progress_events
             }), 500
-
-        conversations = []
-        for chunk in video_result.chunks:
-            chunk_meta = dict(chunk.metadata)
-            meta_data = {
-                'source_type': chunk_meta.get('source_type', 'file_path'),
-                'video_name': chunk_meta.get('video_name', ''),
-                'time_range': chunk_meta.get('time_range', ''),
-            }
-
-            # 优先使用 chunk.text（完整内容），如果没有则使用 chunk_summary（摘要）
-            chunk_text = chunk.text.strip() if chunk.text else ''
-            chunk_summary = chunk_meta.get('chunk_summary', '').strip()
-            agent_reply = chunk_text or chunk_summary or '该视频片段未生成可用摘要'
-            
-            video_name = meta_data['video_name']
-            time_range = meta_data['time_range']
-            user_input = f"{video_name}, {time_range}发生了什么？"
-
-            timestamp = get_timestamp()
-            # 去重：如果 short-term 中已有相同 video_name 和 time_range 的记忆，则跳过添加
-            existing = False
-            try:
-                for m in memory_system.short_term_memory.get_all():
-                    m_md = m.get('meta_data', {}) or {}
-                    if (
-                        m_md.get('video_name') == meta_data.get('video_name')
-                        and m_md.get('time_range') == meta_data.get('time_range')
-                    ):
-                        existing = True
-                        break
-            except Exception:
-                existing = False
-
-            if not existing:
-                memory_system.add_memory(
-                    user_input=user_input,
-                    agent_response=agent_reply,
-                    timestamp=timestamp,
-                    meta_data=meta_data
-                )
-            else:
-                print(f"Skipping duplicate memory for {meta_data.get('video_name')} {meta_data.get('time_range')}")
-
-            conversations.append({
-                'user_input': user_input,
-                'agent_response': agent_reply,
-                'timestamp': timestamp,
-                'meta_data': meta_data
-            })
-
-        return jsonify({
-            'success': True,
-            'ingested_rounds': len(conversations),
-            'conversations': conversations,
-            'videorag_metadata': video_result.metadata,
-            'progress': progress_events
-        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:

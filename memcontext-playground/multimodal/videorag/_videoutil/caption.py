@@ -134,7 +134,7 @@ def _merge_adjacent_identical_lines(text: str) -> str:
     return "\n".join(out_lines)
 
 
-def _coarsen_frame_times(frame_times, max_samples=3):
+def _coarsen_frame_times(frame_times, max_samples=15):
     """Reduce frame_times to at most max_samples evenly spaced samples.
 
     If frame_times is an array-like of times, return a shorter list with the same start and end.
@@ -238,14 +238,17 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
             torch_dtype=torch.float16,
             device_map="cuda",
         )
-        tokenizer = AutoTokenizer.from_pretrained('/root/models/MiniCPM-V-2_6-int4', trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            '/root/models/MiniCPM-V-2_6-int4', 
+            trust_remote_code=True,
+        )
         model.eval()
         
         with VideoFileClip(video_path) as video:
             for index in tqdm(segment_index2name, desc=f"Captioning Video {video_name}"):
                 frame_times = segment_times_info[index]["frame_times"]
                 # Coarsen sampling to avoid many near-duplicate frames
-                frame_times = _coarsen_frame_times(frame_times, max_samples=3)
+                frame_times = _coarsen_frame_times(frame_times, max_samples=15)
                 video_frames = encode_video(video, frame_times)
                 segment_transcript = transcripts.get(index, "")
                 start_time, end_time = segment_times_info[index]["timestamp"]
@@ -258,7 +261,7 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
                 msgs = [{'role': 'user', 'content': video_frames + [query]}]
                 params = {}
                 params["use_image_id"] = False
-                params["max_slice_nums"] = 2
+                params["max_slice_nums"] = 10
                 segment_caption = model.chat(
                     image=None,
                     msgs=msgs,
@@ -367,7 +370,7 @@ def merge_segment_information(segment_index2name, segment_times_info, transcript
         caption_metadata["chunk_count_estimate"] = segment_total
         caption_metadata["duration_seconds"] = duration_seconds
         caption_metadata["time_range"] = time_range
-        caption_metadata["transcription_model"] = "faster-distil-whisper-large-v3"
+        caption_metadata["transcription_model"] = "faster-whisper-large-v3-turbo"
 
         inserting_segments[index] = {
             "content": f"Caption:\n{caption_text}\nTranscript:\n{transcript_text}\n\n",
@@ -402,7 +405,7 @@ def retrieved_segment_caption(caption_model, caption_tokenizer, refine_knowledge
         except Exception:
             num_sampled_frames = 3
         frame_times = np.linspace(start, end, num_sampled_frames, endpoint=False).tolist()
-        frame_times = _coarsen_frame_times(frame_times, max_samples=3)
+        frame_times = _coarsen_frame_times(frame_times, max_samples=15)
         video_frames = encode_video(video, frame_times)
         segment_transcript = video_segments._data[video_name][index].get("transcript", "")
         intervals = "\n".join(_format_time_intervals(frame_times))

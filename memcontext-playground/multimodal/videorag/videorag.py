@@ -133,6 +133,7 @@ class VideoRAG:
             self.caption_tokenizer = AutoTokenizer.from_pretrained(
                 '/root/models/MiniCPM-V-2_6-int4',
                 trust_remote_code=True,
+                use_fast=False  # 显式指定使用慢速处理器，消除警告
             )
             self.caption_model.eval()
         else:

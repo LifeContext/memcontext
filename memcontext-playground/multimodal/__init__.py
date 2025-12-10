@@ -9,7 +9,7 @@ from .converter import (
 from .factory import ConverterFactory
 
 # Import converter modules so their registrations run on package import.
-from .converters import audio_converter, image_converter, video_converter, file_converter  # noqa: F401
+from .converters import audio_converter, image_converter, video_converter, file_converter, videorag_converter  # noqa: F401
 
 __all__ = [
     "MultimodalConverter",
