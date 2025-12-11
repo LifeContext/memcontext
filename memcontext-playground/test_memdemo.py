@@ -14,7 +14,7 @@ ADD_MM_ENDPOINT = f"{SERVER}/add_multimodal_memory"
 
 def init_memory(session):
     payload = {
-        "user_id": "video_user2",
+        "user_id": "video_user5",
         "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
         "base_url": "https://api.deepseek.com/v1",
         "model_name": "deepseek-chat",
@@ -56,7 +56,8 @@ def main():
     session_id = init_memory(session)
     print(f"Session ready: {session_id}")
 
-    result = add_video(session=session, video_path="/root/repo/uni-mem/files/test_video.mp4")
+    # result = add_video(session=session, video_path="/root/repo/uni-mem/files/test_video.mp4")
+    result = add_video(session=session, video_path="/root/repo/uni-mem/files/BigBuckBunny_320x180.mp4")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":

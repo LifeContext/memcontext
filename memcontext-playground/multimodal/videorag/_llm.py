@@ -427,7 +427,7 @@ async def deepseek_complete_if_cache(
         response = await client.post(
             "https://api.deepseek.com/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {os.environ.get('DEEPSEEK_API_KEY', 'sk-*******')}",
+                "Authorization": f"Bearer {os.environ.get('DEEPSEEK_API_KEY')}",
                 "Content-Type": "application/json"
             },
             json={
@@ -472,7 +472,7 @@ async def bge_m3_embedding(model_name: str, texts: list[str]) -> np.ndarray:
         response = await client.post(
             "https://api.siliconflow.cn/v1/embeddings",
             headers={
-                "Authorization": f"Bearer {os.environ.get('SILICONFLOW_API_KEY', 'sk-******')}",
+                "Authorization": f"Bearer {os.environ.get('SILICONFLOW_API_KEY')}",
                 "Content-Type": "application/json"
             },
             json={

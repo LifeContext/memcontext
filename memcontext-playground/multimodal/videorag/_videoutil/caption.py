@@ -246,62 +246,164 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
         
         with VideoFileClip(video_path) as video:
             for index in tqdm(segment_index2name, desc=f"Captioning Video {video_name}"):
-                frame_times = segment_times_info[index]["frame_times"]
-                # Coarsen sampling to avoid many near-duplicate frames
-                frame_times = _coarsen_frame_times(frame_times, max_samples=15)
-                video_frames = encode_video(video, frame_times)
-                segment_transcript = transcripts.get(index, "")
-                start_time, end_time = segment_times_info[index]["timestamp"]
-                intervals = "\n".join(_format_time_intervals(frame_times))
-                query = STRUCTURED_PROMPT_TEMPLATE.format(
-                    intervals=intervals,
-                    transcript=segment_transcript or "",
-                    focus_clause="",
-                )
-                msgs = [{'role': 'user', 'content': video_frames + [query]}]
-                params = {}
-                params["use_image_id"] = False
-                params["max_slice_nums"] = 10
-                segment_caption = model.chat(
-                    image=None,
-                    msgs=msgs,
-                    tokenizer=tokenizer,
-                    **params
-                )
-                # Debug: 打印实际发送的 prompt 和 LLM 的原始响应
-                if index == 0:  # 只打印第一个 segment 的调试信息
-                    print("=" * 80)
-                    print("DEBUG: Actual prompt sent to LLM (last 500 chars):")
-                    print(query[-500:])
-                    print("=" * 80)
-                    print("DEBUG: LLM raw response (first 1000 chars):")
-                    print(segment_caption[:1000])
-                    print("=" * 80)
-                raw_text, parsed_metadata = _extract_json_from_response(segment_caption)
-                # Perform inline dedupe/merge of adjacent identical timestamped lines
                 try:
-                    raw_text = _merge_adjacent_identical_lines(raw_text)
-                    if isinstance(parsed_metadata, dict) and isinstance(parsed_metadata.get("chunk_summary"), str):
-                        parsed_metadata["chunk_summary"] = _merge_adjacent_identical_lines(parsed_metadata["chunk_summary"])
-                except Exception:
-                    # In case merging fails, keep the original raw_text
-                    pass
-                # Debug: 打印解析后的 metadata
-                if index == 0:
-                    print("DEBUG: Parsed metadata chunk_summary type:", type(parsed_metadata.get("chunk_summary")))
-                    if "chunk_summary" in parsed_metadata:
-                        chunk_summary_value = parsed_metadata["chunk_summary"]
-                        print("DEBUG: chunk_summary value (first 200 chars):", str(chunk_summary_value)[:200])
-                        if isinstance(chunk_summary_value, str) and chunk_summary_value.strip().startswith("{"):
-                            print("DEBUG: WARNING! chunk_summary is a JSON string!")
-                    print("=" * 80)
-                normalized_metadata = _ensure_metadata_defaults(parsed_metadata, raw_text)
-                caption_result[index] = {
-                    "raw": normalized_metadata["chunk_summary"],
-                    "metadata": normalized_metadata,
-                }
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    frame_times = segment_times_info[index]["frame_times"]
+                    # 允许更多帧采样，但通过分批处理避免张量大小不匹配
+                    # 如果 rough_num_frames_per_segment 较大，可以采样更多帧
+                    max_samples = min(50, len(frame_times))  # 最多50帧，但不超过实际帧数
+                    frame_times = _coarsen_frame_times(frame_times, max_samples=max_samples)
+                    video_frames = encode_video(video, frame_times)
+                    segment_transcript = transcripts.get(index, "")
+                    start_time, end_time = segment_times_info[index]["timestamp"]
+                    
+                    # 分批处理图像，避免张量大小不匹配
+                    num_frames = len(video_frames)
+                    batch_size = 8  # 每批最多8帧，这是模型能稳定处理的帧数
+                    num_batches = (num_frames + batch_size - 1) // batch_size if num_frames > batch_size else 1
+                    all_captions = []  # 用于存储分批处理的结果
+                    
+                    if num_frames <= batch_size:
+                        # 帧数较少，直接处理
+                        intervals = "\n".join(_format_time_intervals(frame_times))
+                        query = STRUCTURED_PROMPT_TEMPLATE.format(
+                            intervals=intervals,
+                            transcript=segment_transcript or "",
+                            focus_clause="",
+                        )
+                        msgs = [{'role': 'user', 'content': video_frames + [query]}]
+                        params = {}
+                        params["use_image_id"] = False
+                        params["max_slice_nums"] = min(10, max(2, num_frames // 2))
+                        
+                        segment_caption = model.chat(
+                            image=None,
+                            msgs=msgs,
+                            tokenizer=tokenizer,
+                            **params
+                        )
+                    else:
+                        # 帧数较多，分批处理并合并结果
+                        
+                        for batch_idx in range(num_batches):
+                            start_idx = batch_idx * batch_size
+                            end_idx = min((batch_idx + 1) * batch_size, num_frames)
+                            batch_frames = video_frames[start_idx:end_idx]
+                            batch_frame_times = frame_times[start_idx:end_idx]
+                            
+                            intervals = "\n".join(_format_time_intervals(batch_frame_times))
+                            # 对于非第一批，添加上下文提示
+                            if batch_idx > 0:
+                                focus_clause = f" 这是视频片段的一部分（第{batch_idx+1}/{num_batches}批），请结合之前的上下文。"
+                            else:
+                                focus_clause = ""
+                            
+                            query = STRUCTURED_PROMPT_TEMPLATE.format(
+                                intervals=intervals,
+                                transcript=segment_transcript or "",
+                                focus_clause=focus_clause,
+                            )
+                            msgs = [{'role': 'user', 'content': batch_frames + [query]}]
+                            params = {}
+                            params["use_image_id"] = False
+                            params["max_slice_nums"] = min(10, max(2, len(batch_frames) // 2))
+                            
+                            try:
+                                batch_caption = model.chat(
+                                    image=None,
+                                    msgs=msgs,
+                                    tokenizer=tokenizer,
+                                    **params
+                                )
+                                all_captions.append(batch_caption)
+                            except RuntimeError as e:
+                                if "Sizes of tensors must match" in str(e):
+                                    # 即使分批也失败，使用更小的批次或 transcript
+                                    error_queue.put(f"Warning: Segment {index} batch {batch_idx+1} failed, using transcript fallback")
+                                    batch_intervals = "\n".join(_format_time_intervals(batch_frame_times))
+                                    all_captions.append(f"[{batch_frame_times[0]:.2f}s -> {batch_frame_times[-1]:.2f}s] {segment_transcript}")
+                                else:
+                                    raise
+                            
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        
+                        # 合并所有批次的 caption
+                        segment_caption = "\n\n".join(all_captions)
+                    
+                    # Debug: 打印实际发送的 prompt 和 LLM 的原始响应
+                    if index == 0:  # 只打印第一个 segment 的调试信息
+                        print("=" * 80)
+                        print(f"DEBUG: Processed {num_frames} frames in {num_batches if num_frames > batch_size else 1} batch(es)")
+                        print("DEBUG: LLM raw response (first 1000 chars):")
+                        print(segment_caption[:1000] if isinstance(segment_caption, str) else str(segment_caption)[:1000])
+                        print("=" * 80)
+                    
+                    # 对于分批处理的结果，需要特殊处理 JSON 提取
+                    if num_frames > batch_size:
+                        # 分批处理的结果是多个 caption 的合并，可能不是标准 JSON 格式
+                        # 尝试提取所有批次的文本内容
+                        raw_text = segment_caption
+                        # 尝试从最后一个批次提取 metadata（如果有）
+                        try:
+                            if all_captions and len(all_captions) > 0:
+                                _, parsed_metadata = _extract_json_from_response(all_captions[-1])
+                            else:
+                                parsed_metadata = {}
+                        except:
+                            parsed_metadata = {}
+                    else:
+                        raw_text, parsed_metadata = _extract_json_from_response(segment_caption)
+                    # Perform inline dedupe/merge of adjacent identical timestamped lines
+                    try:
+                        raw_text = _merge_adjacent_identical_lines(raw_text)
+                        if isinstance(parsed_metadata, dict) and isinstance(parsed_metadata.get("chunk_summary"), str):
+                            parsed_metadata["chunk_summary"] = _merge_adjacent_identical_lines(parsed_metadata["chunk_summary"])
+                    except Exception:
+                        # In case merging fails, keep the original raw_text
+                        pass
+                    # Debug: 打印解析后的 metadata
+                    if index == 0:
+                        print("DEBUG: Parsed metadata chunk_summary type:", type(parsed_metadata.get("chunk_summary")))
+                        if "chunk_summary" in parsed_metadata:
+                            chunk_summary_value = parsed_metadata["chunk_summary"]
+                            print("DEBUG: chunk_summary value (first 200 chars):", str(chunk_summary_value)[:200])
+                            if isinstance(chunk_summary_value, str) and chunk_summary_value.strip().startswith("{"):
+                                print("DEBUG: WARNING! chunk_summary is a JSON string!")
+                        print("=" * 80)
+                    normalized_metadata = _ensure_metadata_defaults(parsed_metadata, raw_text)
+                    caption_result[index] = {
+                        "raw": normalized_metadata["chunk_summary"],
+                        "metadata": normalized_metadata,
+                    }
+                except RuntimeError as e:
+                    # 处理张量大小不匹配等运行时错误
+                    error_msg = str(e)
+                    if "Sizes of tensors must match" in error_msg or "tensor" in error_msg.lower():
+                        # 使用 transcript 作为 fallback
+                        segment_transcript = transcripts.get(index, "")
+                        start_time, end_time = segment_times_info[index]["timestamp"]
+                        fallback_text = f"[{start_time:.2f}s -> {end_time:.2f}s] {segment_transcript}" if segment_transcript else f"[{start_time:.2f}s -> {end_time:.2f}s] 视频片段内容"
+                        error_queue.put(f"Warning: Segment {index} caption failed (tensor size mismatch), using transcript fallback: {error_msg[:200]}")
+                        caption_result[index] = {
+                            "raw": fallback_text,
+                            "metadata": _ensure_metadata_defaults({}, fallback_text),
+                        }
+                    else:
+                        # 其他运行时错误，重新抛出
+                        raise
+                except Exception as e:
+                    # 其他错误，使用 transcript 作为 fallback
+                    segment_transcript = transcripts.get(index, "")
+                    start_time, end_time = segment_times_info[index]["timestamp"]
+                    fallback_text = f"[{start_time:.2f}s -> {end_time:.2f}s] {segment_transcript}" if segment_transcript else f"[{start_time:.2f}s -> {end_time:.2f}s] 视频片段内容"
+                    error_queue.put(f"Warning: Segment {index} caption failed, using transcript fallback: {str(e)[:200]}")
+                    caption_result[index] = {
+                        "raw": fallback_text,
+                        "metadata": _ensure_metadata_defaults({}, fallback_text),
+                    }
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
     except Exception as e:
         error_queue.put(f"Error in segment_caption:\n {str(e)}")
         raise RuntimeError
@@ -405,7 +507,7 @@ def retrieved_segment_caption(caption_model, caption_tokenizer, refine_knowledge
         except Exception:
             num_sampled_frames = 3
         frame_times = np.linspace(start, end, num_sampled_frames, endpoint=False).tolist()
-        frame_times = _coarsen_frame_times(frame_times, max_samples=15)
+        frame_times = _coarsen_frame_times(frame_times, max_samples=30)
         video_frames = encode_video(video, frame_times)
         segment_transcript = video_segments._data[video_name][index].get("transcript", "")
         intervals = "\n".join(_format_time_intervals(frame_times))

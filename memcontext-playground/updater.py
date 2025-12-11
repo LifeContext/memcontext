@@ -130,7 +130,8 @@ class Updater:
                 "analyzed": False,  # Default for new pages from short-term
                 "pre_page": None,
                 "next_page": None,
-                "meta_info": None
+                "meta_info": None,
+                "meta_data": qa_pair.get("meta_data", {})  # 保留 meta_data，包含视频元数据信息
             }
             
             is_continuous = check_conversation_continuity(temp_last_page_in_batch, current_page_obj, self.client, model=self.llm_model)

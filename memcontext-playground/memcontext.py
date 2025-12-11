@@ -21,8 +21,8 @@ try:
     from .long_term import LongTermMemory
     from .updater import Updater
     from .retriever import Retriever
-from .multimodal import ConverterFactory
-from .multimodal.converter import ConversionChunk, ConversionOutput
+    from .multimodal import ConverterFactory
+    from .multimodal.converter import ConversionChunk, ConversionOutput
     from .multimodal.utils import guess_file_extension, guess_mime_type, compute_file_hash
 except ImportError:
     # 回退到绝对导入（当作为独立模块使用时）
@@ -149,6 +149,57 @@ class Memcontext:
         )
         
         self.mid_term_heat_threshold = mid_term_heat_threshold
+
+    def _extract_knowledge_from_recent_mid_term(self, pages_to_extract=None):
+        """
+        从最近的 mid_term 页面中提取知识，不依赖 heat 阈值。
+        用于批量添加记忆后立即提取知识。
+        """
+        if pages_to_extract is None:
+            # 如果没有提供页面，从最新的 session 中获取未分析的页面
+            if not self.mid_term_memory.heap:
+                return
+            
+            # 获取最新的 session（heat 最高的）
+            neg_heat, sid = self.mid_term_memory.heap[0]
+            session = self.mid_term_memory.sessions.get(sid)
+            if not session:
+                return
+            
+            pages_to_extract = [p for p in session.get("details", []) if not p.get("analyzed", False)]
+        
+        if not pages_to_extract:
+            print("Memorycontext: No unanalyzed pages to extract knowledge from.")
+            return
+        
+        print(f"Memorycontext: Extracting knowledge from {len(pages_to_extract)} pages...")
+        
+        try:
+            # 提取知识
+            knowledge_result = gpt_knowledge_extraction(pages_to_extract, self.client, model=self.llm_model)
+            
+            new_user_private_knowledge = knowledge_result.get("private")
+            new_assistant_knowledge = knowledge_result.get("assistant_knowledge")
+            
+            # 存储用户私有知识
+            if new_user_private_knowledge and new_user_private_knowledge.lower() != "none":
+                for line in new_user_private_knowledge.split('\n'):
+                    if line.strip() and line.strip().lower() not in ["none", "- none", "- none."]:
+                        self.user_long_term_memory.add_user_knowledge(line.strip())
+                        print(f"Memorycontext: Added user knowledge: {line.strip()[:50]}...")
+            
+            # 存储 Assistant Knowledge
+            if new_assistant_knowledge and new_assistant_knowledge.lower() != "none":
+                for line in new_assistant_knowledge.split('\n'):
+                    if line.strip() and line.strip().lower() not in ["none", "- none", "- none."]:
+                        self.assistant_long_term_memory.add_assistant_knowledge(line.strip())
+                        print(f"Memorycontext: Added assistant knowledge: {line.strip()[:50]}...")
+            
+            print("Memorycontext: Knowledge extraction completed.")
+        except Exception as e:
+            print(f"Memorycontext: Error extracting knowledge: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _trigger_profile_and_knowledge_update_if_needed(self):
         """
@@ -345,16 +396,33 @@ class Memcontext:
             )
             
             # 插入到 mid_term
+            # 对于批量添加，将所有页面作为一个整体插入到一个 session
+            # 如果 multi_summary 返回多个主题，合并所有主题的摘要和关键词
             if multi_summary_result and multi_summary_result.get("summaries"):
+                # 合并所有主题的摘要和关键词
+                all_summaries = []
+                all_keywords = set()
                 for summary_item in multi_summary_result["summaries"]:
-                    theme_summary = summary_item.get("content", "General summary of recent interactions.")
-                    theme_keywords = summary_item.get("keywords", [])
-                    self.mid_term_memory.insert_pages_into_session(
-                        summary_for_new_pages=theme_summary,
-                        keywords_for_new_pages=theme_keywords,
-                        pages_to_insert=pages_to_insert,
-                        similarity_threshold=self.mid_term_similarity_threshold
-                    )
+                    theme = summary_item.get("theme", "")
+                    content = summary_item.get("content", "")
+                    if theme and content:
+                        all_summaries.append(f"{theme}: {content}")
+                    keywords = summary_item.get("keywords", [])
+                    if isinstance(keywords, list):
+                        all_keywords.update(keywords)
+                    elif isinstance(keywords, str):
+                        all_keywords.update([k.strip() for k in keywords.split(",") if k.strip()])
+                
+                combined_summary = " | ".join(all_summaries) if all_summaries else "Batch of memories from multimodal content ingestion."
+                combined_keywords = list(all_keywords)
+                
+                # 只插入一次，使用合并后的摘要
+                self.mid_term_memory.insert_pages_into_session(
+                    summary_for_new_pages=combined_summary,
+                    keywords_for_new_pages=combined_keywords,
+                    pages_to_insert=pages_to_insert,
+                    similarity_threshold=self.mid_term_similarity_threshold
+                )
             else:
                 # Fallback
                 fallback_summary = "Batch of memories from multimodal content ingestion."
@@ -373,7 +441,9 @@ class Memcontext:
             self.mid_term_memory.save()
             print(f"Memorycontext: Successfully batch added {len(pages_to_insert)} memories to mid-term.")
             
-            # 检查是否需要触发 profile 更新
+            # 批量添加后，不立即提取知识，等待 heat 达到阈值后再提取
+            # 这样可以避免过度提取细粒度的知识，让系统自然触发知识提取
+            # 只检查是否需要触发 profile 更新（基于 heat）
             self._trigger_profile_and_knowledge_update_if_needed()
         else:
             # 使用原来的方式，逐个添加到 short_term
@@ -409,10 +479,62 @@ class Memcontext:
         ])
 
         # 3. Format retrieved mid-term pages (retrieval_queue equivalent)
-        retrieval_text = "\n".join([
-            f"【Historical Memory】\nUser: {page.get('user_input', '')}\nAssistant: {page.get('agent_response', '')}\nTime: {page.get('timestamp', '')}\nConversation chain overview: {page.get('meta_info','N/A')}"
-            for page in retrieved_pages
-        ])
+        # 提取查询中提到的视频信息（如果有），用于过滤结果
+        query_video_path = None
+        if '视频' in query:
+            import re
+            # 尝试从查询中提取视频路径或名称
+            video_match = re.search(r'["\']?([^"\']+\.(mp4|avi|mov|mkv))["\']?', query)
+            if video_match:
+                query_video_path = video_match.group(1)
+            else:
+                # 尝试提取"xxx视频"格式
+                video_match = re.search(r'([^\s]+)视频', query)
+                if video_match:
+                    query_video_path = video_match.group(1)
+        
+        retrieval_text_parts = []
+        for page in retrieved_pages:
+            # 安全获取 meta_data，确保是字典类型
+            try:
+                page_meta = page.get('meta_data', {})
+                if not isinstance(page_meta, dict):
+                    page_meta = {}
+            except (AttributeError, TypeError):
+                page_meta = {}
+            
+            page_video_path = None
+            
+            # 从 user_input 中提取视频路径（格式：描述{video_path}视频的{time_range}的内容）
+            user_input = page.get('user_input', '')
+            if '视频' in user_input and '描述' in user_input:
+                import re
+                try:
+                    match = re.search(r'描述(.+?)视频的', user_input)
+                    if match:
+                        page_video_path = match.group(1)
+                except Exception as e:
+                    print(f"Memorycontext: Error extracting video_path from user_input: {e}")
+            
+            # 如果从 user_input 中提取失败，尝试从 meta_data 中获取（使用 .get() 安全访问）
+            if not page_video_path:
+                page_video_path = page_meta.get('video_path') or page_meta.get('video_name')
+            
+            # 如果查询中指定了视频，只返回匹配的视频内容
+            if query_video_path and page_video_path:
+                try:
+                    if query_video_path not in page_video_path and page_video_path not in query_video_path:
+                        continue  # 跳过不匹配的视频
+                except TypeError:
+                    # 如果 page_video_path 不是字符串，跳过比较
+                    pass
+            
+            page_text = f"【Historical Memory】\nUser: {page.get('user_input', '')}\nAssistant: {page.get('agent_response', '')}\nTime: {page.get('timestamp', '')}\nConversation chain overview: {page.get('meta_info','N/A')}"
+            if page_video_path:
+                page_text += f"\n[Video Source: {page_video_path}]"
+            retrieval_text_parts.append(page_text)
+        
+        retrieval_text = "\n\n".join(retrieval_text_parts)
 
         # 4. Get user profile
         user_profile_text = self.user_long_term_memory.get_raw_user_profile(self.user_id)
@@ -576,7 +698,8 @@ class Memcontext:
                     metadata=cached.get("metadata", {}),
                 )
                 output.ensure_chunks()
-                print(f"Memorycontext: Loaded cached conversion for file_id={file_id}")
+                print(f"Memorycontext: Video already processed (file_id={file_id}), using cached result. Skipping re-processing.")
+                # 如果缓存存在，直接使用缓存，不重新处理
             except Exception as e:
                 print(f"Memorycontext: Failed to load cache for file_id={file_id}, will re-run conversion. Error: {e}")
                 output = None
@@ -607,27 +730,53 @@ class Memcontext:
         # 准备所有记忆数据
         memories_to_add = []
         for chunk in output.chunks:
-            chunk_meta = {
-                **base_metadata,
-                **output.metadata,
-                **chunk.metadata,
-                "source_type": "multimodal",
-            }
-            chunk_agent_response = agent_response or chunk_meta.get(
-                "chunk_summary",
-                f"[Multimodal] Stored content from {chunk_meta.get('original_filename', 'file')}",
-            )
+            # 安全地合并元数据，确保所有值都是字典
+            try:
+                base_meta = base_metadata if isinstance(base_metadata, dict) else {}
+                output_meta = output.metadata if isinstance(output.metadata, dict) else {}
+                chunk_meta_dict = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+                
+                chunk_meta = {
+                    **base_meta,
+                    **output_meta,
+                    **chunk_meta_dict,
+                    "source_type": "multimodal",
+                }
+            except (TypeError, AttributeError) as e:
+                print(f"Memorycontext: Error merging metadata: {e}")
+                chunk_meta = {"source_type": "multimodal"}
+            
+            # 对于视频内容，使用完整的文本描述（chunk.text）作为 agent_response
+            # 这样检索时能获得详细的视频内容，而不是只有摘要
+            if chunk_meta.get("video_path") or chunk_meta.get("video_name"):
+                chunk_agent_response = chunk.text  # 使用完整的视频描述文本
+            else:
+                chunk_agent_response = agent_response or chunk_meta.get(
+                    "chunk_summary",
+                    f"[Multimodal] Stored content from {chunk_meta.get('original_filename', 'file')}",
+                )
             
             # 对于视频内容，构建格式化的 user_input
-            video_path = chunk_meta.get("video_path") or chunk_meta.get("original_filename", "视频")
-            time_range = chunk_meta.get("time_range", "")
-            
-            # 如果是视频内容（通过 video_path 或 time_range 判断）且有 time_range，使用新格式
-            if (chunk_meta.get("video_path") or chunk_meta.get("video_name")) and time_range:
-                user_input = f"描述{video_path}视频的{time_range}的内容"
-            else:
-                # 非视频内容或没有 time_range，使用原来的格式
+            # 安全获取 video_path，确保不会为 None 或抛出 KeyError
+            try:
+                video_path = chunk_meta.get("video_path") or chunk_meta.get("original_filename") or chunk_meta.get("video_name") or "视频"
+                time_range = chunk_meta.get("time_range", "")
+                
+                # 如果是视频内容（通过 video_path 或 time_range 判断）且有 time_range，使用新格式
+                if (chunk_meta.get("video_path") or chunk_meta.get("video_name")) and time_range:
+                    # 确保 video_path 是字符串且不为空
+                    if not isinstance(video_path, str) or not video_path or video_path == "视频":
+                        video_path = chunk_meta.get("video_name") or chunk_meta.get("original_filename") or "视频"
+                    if not isinstance(video_path, str):
+                        video_path = str(video_path) if video_path else "视频"
+                    user_input = f"描述{video_path}视频的{time_range}的内容"
+                else:
+                    # 非视频内容或没有 time_range，使用原来的格式
+                    user_input = chunk.text
+            except Exception as e:
+                print(f"Memorycontext: Error building user_input: {e}, using chunk.text as fallback")
                 user_input = chunk.text
+                video_path = "视频"  # 设置默认值
             
             memories_to_add.append({
                 "user_input": user_input,
@@ -637,36 +786,15 @@ class Memcontext:
             })
             timestamps.append(get_timestamp())
         
-        # 如果记忆数量超过 short_term 容量：
-        #  - 多余部分直接批量写入 mid_term（跳过 short_term）
-        #  - 保留最后 short_term 容量（默认 7 条）在 short_term，便于后续对话快速命中
-        cap = self.short_term_memory.max_capacity
-        if len(memories_to_add) > cap:
-            bulk_to_mid = memories_to_add[:-cap]  # 超出容量的部分
-            tail_to_st = memories_to_add[-cap:]   # 保留在 short_term 的部分
-
-            if bulk_to_mid:
-                print(f"Memorycontext: Large batch detected ({len(memories_to_add)} items). "
-                      f"Sending {len(bulk_to_mid)} to mid-term (skip short-term) and keeping {len(tail_to_st)} in short-term.")
-                self.add_memories_batch(bulk_to_mid, skip_short_term=True)
-
-            # 将尾部 cap 条写入 short_term
-            for mem in tail_to_st:
-                self.add_memory(
-                    user_input=mem["user_input"],
-                    agent_response=mem["agent_response"],
-                    timestamp=mem["timestamp"],
-                    meta_data=mem["meta_data"]
-                )
-        else:
-            # 少量内容，使用原来的方式逐个添加
-            for mem in memories_to_add:
-                self.add_memory(
-                    user_input=mem["user_input"],
-                    agent_response=mem["agent_response"],
-                    timestamp=mem["timestamp"],
-                    meta_data=mem["meta_data"]
-                )
+        # 使用正常流程：逐个添加到 short_term，超出容量后自动转到 mid_term
+        # 这样更简单，也更符合原来的设计逻辑
+        for mem in memories_to_add:
+            self.add_memory(
+                user_input=mem["user_input"],
+                agent_response=mem["agent_response"],
+                timestamp=mem["timestamp"],
+                meta_data=mem["meta_data"]
+            )
 
         return {
             "status": output.status,

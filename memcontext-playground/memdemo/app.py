@@ -5,6 +5,7 @@ import json
 import shutil
 import tempfile
 from datetime import datetime
+from pathlib import Path
 import secrets
 from werkzeug.utils import secure_filename
 
@@ -73,8 +74,7 @@ def init_memory():
     api_key = data.get('api_key', '').strip()
     base_url = data.get('base_url', '').strip()
     model = data.get('model_name', '').strip()
-    # 不再自动启用 SiliconFlow，避免远程 embedding 403
-    siliconflow_key = ""
+    siliconflow_key = data.get('siliconflow_key', '').strip()
 
     # 默认使用 DeepSeek API
     if not base_url:
@@ -86,7 +86,18 @@ def init_memory():
         return jsonify({'error': 'User ID 和 API Key 是必需的。Base URL 和 Model Name 如果不提供，将默认使用 DeepSeek API。'}), 400
     
     assistant_id = f"assistant_{user_id}"
-    embedding_kwargs = {}  # 强制使用本地/默认 embedding，避免调用 siliconflow
+    embedding_kwargs = {}
+    if siliconflow_key:
+        os.environ['SILICONFLOW_API_KEY'] = siliconflow_key
+        embedding_kwargs = {
+            'use_siliconflow': True,
+            'siliconflow_model': "BAAI/bge-m3"
+        }
+    elif os.environ.get('SILICONFLOW_API_KEY'):
+        embedding_kwargs = {
+            'use_siliconflow': True,
+            'siliconflow_model': "BAAI/bge-m3"
+        }
     
     try:
         # Initialize memcontext for this session
@@ -103,8 +114,8 @@ def init_memory():
             mid_term_capacity=200,   # Smaller for demo
             long_term_knowledge_capacity=1000,  # Smaller for demo
             mid_term_heat_threshold=10.0,
-            embedding_model_name="all-MiniLM-L6-v2",  # 使用本地/默认 embedding，避免远程请求
-            embedding_model_kwargs=embedding_kwargs,  # 空字典表示不使用 siliconflow
+            embedding_model_name="BAAI/bge-m3" if embedding_kwargs.get('use_siliconflow') else "all-MiniLM-L6-v2",
+            embedding_model_kwargs=embedding_kwargs,
             llm_model=model
         )
         
@@ -153,7 +164,144 @@ def chat():
             'timestamp': get_timestamp()
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"Chat error: {error_trace}")
+        return jsonify({
+            'error': str(e), 
+            'traceback': error_trace
+        }), 500
+
+@app.route('/import_from_cache', methods=['POST'])
+def import_from_cache_endpoint():
+    """从 temp_memory 缓存直接导入，跳过 videorag 解析"""
+    session_id = session.get('memory_session_id')
+    if not session_id or session_id not in memory_systems:
+        return jsonify({'error': 'Memory system not initialized'}), 400
+
+    memory_system = memory_systems[session_id]
+    
+    try:
+        data = request.get_json(silent=True) or {}
+        file_id = data.get('file_id', '').strip()
+        
+        if not file_id:
+            return jsonify({'error': 'file_id is required'}), 400
+        
+        # 检查缓存文件
+        cache_dir = Path(memory_system.data_storage_path) / "temp_memory"
+        cache_file = cache_dir / f"{file_id}.json"
+        
+        if not cache_file.exists():
+            return jsonify({'error': f'Cache file not found for file_id: {file_id}'}), 404
+        
+        # 加载缓存
+        with open(cache_file, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        
+        # 构建 ConversionOutput
+        from multimodal.converter import ConversionChunk, ConversionOutput
+        
+        cached_chunks = []
+        for idx, ch in enumerate(cached.get("chunks", [])):
+            meta = ch.get("metadata", {}) or {}
+            chunk_idx = meta.get("chunk_index", idx)
+            cached_chunks.append(
+                ConversionChunk(
+                    text=ch.get("text", ""),
+                    chunk_index=chunk_idx,
+                    metadata=meta,
+                )
+            )
+        
+        output = ConversionOutput(
+            status="success",
+            text="\n\n".join(c.text for c in cached_chunks),
+            chunks=cached_chunks,
+            metadata=cached.get("metadata", {}),
+        )
+        output.ensure_chunks()
+        
+        # 直接使用 _ingest_single_multimodal 的逻辑来添加记忆
+        base_metadata = cached.get("metadata", {})
+        timestamps = []
+        memories_to_add = []
+        
+        for chunk in output.chunks:
+            # 安全地合并元数据，确保所有值都是字典
+            try:
+                base_meta = base_metadata if isinstance(base_metadata, dict) else {}
+                chunk_meta_dict = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+                
+                chunk_meta = {
+                    **base_meta,
+                    **chunk_meta_dict,
+                    "source_type": "multimodal",
+                }
+            except (TypeError, AttributeError) as e:
+                print(f"Import cache: Error merging metadata: {e}")
+                chunk_meta = {"source_type": "multimodal"}
+            
+            # 对于视频内容，使用完整的文本描述（chunk.text）作为 agent_response
+            # 这样检索时能获得详细的视频内容，而不是只有摘要
+            if chunk_meta.get("video_path") or chunk_meta.get("video_name"):
+                chunk_agent_response = chunk.text  # 使用完整的视频描述文本
+            else:
+                chunk_agent_response = chunk_meta.get(
+                    "chunk_summary",
+                    f"[Multimodal] Stored content from {chunk_meta.get('original_filename', 'file')}",
+                )
+            
+            # 对于视频内容，构建格式化的 user_input
+            # 安全获取 video_path，确保不会为 None 或抛出 KeyError
+            try:
+                video_path = chunk_meta.get("video_path") or chunk_meta.get("original_filename") or chunk_meta.get("video_name") or "视频"
+                time_range = chunk_meta.get("time_range", "")
+                
+                if (chunk_meta.get("video_path") or chunk_meta.get("video_name")) and time_range:
+                    # 确保 video_path 是字符串且不为空
+                    if not isinstance(video_path, str) or not video_path or video_path == "视频":
+                        video_path = chunk_meta.get("video_name") or chunk_meta.get("original_filename") or "视频"
+                    if not isinstance(video_path, str):
+                        video_path = str(video_path) if video_path else "视频"
+                    user_input = f"描述{video_path}视频的{time_range}的内容"
+                else:
+                    user_input = chunk.text
+            except Exception as e:
+                print(f"Import cache: Error building user_input: {e}, using chunk.text as fallback")
+                user_input = chunk.text
+                video_path = "视频"  # 设置默认值
+            
+            memories_to_add.append({
+                "user_input": user_input,
+                "agent_response": chunk_agent_response,
+                "timestamp": get_timestamp(),
+                "meta_data": chunk_meta,
+            })
+            timestamps.append(get_timestamp())
+        
+        # 使用正常流程：逐个添加到 short_term
+        for mem in memories_to_add:
+            memory_system.add_memory(
+                user_input=mem["user_input"],
+                agent_response=mem["agent_response"],
+                timestamp=mem["timestamp"],
+                meta_data=mem["meta_data"]
+            )
+        
+        return jsonify({
+            'success': True,
+            'ingested_rounds': len(memories_to_add),
+            'file_id': file_id,
+            'timestamps': timestamps,
+            'message': f'Successfully imported {len(memories_to_add)} chunks from cache'
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'error': f'导入缓存失败: {str(e)}',
+            'traceback': traceback.format_exc() if app.debug else None
+        }), 500
 
 @app.route('/add_multimodal_memory', methods=['POST'])
 def add_multimodal_memory_endpoint():
