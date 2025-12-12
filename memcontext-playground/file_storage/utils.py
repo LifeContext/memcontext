@@ -102,9 +102,12 @@ def format_time_for_filename(seconds: float) -> str:
         seconds: 秒数
     
     Returns:
-        格式化的时间字符串（如：05.30）
+        格式化的时间字符串（如：0_00 表示 0.00 秒，60_00 表示 60.00 秒）
     """
-    return f"{seconds:.2f}".replace('.', '_')
+    # 将秒数转换为整数部分和小数部分
+    int_part = int(seconds)
+    frac_part = int((seconds - int_part) * 100)  # 保留两位小数
+    return f"{int_part}_{frac_part:02d}"  # 格式：0_00, 60_00
 
 
 def parse_time_from_filename(filename: str) -> Optional[tuple[float, float]]:
@@ -112,20 +115,31 @@ def parse_time_from_filename(filename: str) -> Optional[tuple[float, float]]:
     从文件名解析时间范围
     
     Args:
-        filename: 文件名（如：segment_5_30_8_00.mp4）
+        filename: 文件名（如：segment_0_00_60_00.mp4 表示 0.00s - 60.00s）
     
     Returns:
         (start_time, end_time) 元组，解析失败返回None
     """
     try:
-        # 假设格式为 segment_{start}_{end}.mp4
+        # 格式为 segment_{start_int}_{start_frac}_{end_int}_{end_frac}.mp4
+        # 例如：segment_0_00_60_00.mp4 表示 0.00s - 60.00s
         parts = Path(filename).stem.split('_')
-        if len(parts) >= 3 and parts[0] == 'segment':
-            start = float(parts[1].replace('_', '.'))
-            end = float(parts[2].replace('_', '.'))
-            return (start, end)
-    except (ValueError, IndexError):
-        pass
+        if len(parts) >= 5 and parts[0] == 'segment':
+            # 解析开始时间：parts[1]_parts[2] -> int_part.frac_part
+            start_int = int(parts[1])
+            start_frac = int(parts[2])
+            start_time = start_int + start_frac / 100.0
+            
+            # 解析结束时间：parts[3]_parts[4] -> int_part.frac_part
+            end_int = int(parts[3])
+            end_frac = int(parts[4])
+            end_time = end_int + end_frac / 100.0
+            
+            return (start_time, end_time)
+    except (ValueError, IndexError) as e:
+        print(f"Warning: Failed to parse time from filename {filename}: {e}")
+        import traceback
+        traceback.print_exc()
     return None
 
 

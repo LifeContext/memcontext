@@ -353,6 +353,7 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
                             parsed_metadata = {}
                     else:
                         raw_text, parsed_metadata = _extract_json_from_response(segment_caption)
+                    
                     # Perform inline dedupe/merge of adjacent identical timestamped lines
                     try:
                         raw_text = _merge_adjacent_identical_lines(raw_text)
@@ -361,6 +362,7 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
                     except Exception:
                         # In case merging fails, keep the original raw_text
                         pass
+                    
                     # Debug: 打印解析后的 metadata
                     if index == 0:
                         print("DEBUG: Parsed metadata chunk_summary type:", type(parsed_metadata.get("chunk_summary")))
@@ -370,6 +372,7 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
                             if isinstance(chunk_summary_value, str) and chunk_summary_value.strip().startswith("{"):
                                 print("DEBUG: WARNING! chunk_summary is a JSON string!")
                         print("=" * 80)
+                    
                     normalized_metadata = _ensure_metadata_defaults(parsed_metadata, raw_text)
                     caption_result[index] = {
                         "raw": normalized_metadata["chunk_summary"],

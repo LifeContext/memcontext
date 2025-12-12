@@ -104,6 +104,13 @@ def init_memory():
         data_path = './data'
         os.makedirs(data_path, exist_ok=True)
         
+        # 获取 file_storage_base_path（可选，默认与 file_storage 和 memdemo 平齐）
+        file_storage_base_path = data.get('file_storage_base_path', '').strip()
+        if not file_storage_base_path:
+            # 默认使用项目根目录（memcontext-playground），与 file_storage 和 memdemo 平齐
+            # app.py 在 memdemo/ 目录下，所以上一级目录就是项目根目录
+            file_storage_base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        
         memory_system = Memcontext(
             user_id=user_id,
             openai_api_key=api_key,
@@ -116,7 +123,8 @@ def init_memory():
             mid_term_heat_threshold=10.0,
             embedding_model_name="BAAI/bge-m3" if embedding_kwargs.get('use_siliconflow') else "all-MiniLM-L6-v2",
             embedding_model_kwargs=embedding_kwargs,
-            llm_model=model
+            llm_model=model,
+            file_storage_base_path=file_storage_base_path
         )
         
         session_id = secrets.token_hex(8)

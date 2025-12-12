@@ -46,19 +46,28 @@ class VideoConverter(MultimodalConverter):
         video_path = self._normalize_source(source, source_type)
         self._ensure_spawn_start_method()
 
-        working_dir = Path(
-            kwargs.get("working_dir")
-            or self.config.get("working_dir")
-            or "./videorag-workdir"
-        ).expanduser()
+        # 使用 FileStorageManager（必需）
+        file_storage_manager = kwargs.get("file_storage_manager") or self.config.get("file_storage_manager")
+        file_storage_id = kwargs.get("file_storage_id") or self.config.get("file_storage_id")
+        
+        if not file_storage_manager or not file_storage_id:
+            raise ValueError("file_storage_manager and file_storage_id are required")
+        
+        from file_storage import FileType
+        file_record = file_storage_manager.get_file_record(file_storage_id)
+        if not file_record or file_record.file_type != FileType.VIDEO:
+            raise ValueError(f"FileStorageManager: Invalid file_record for file_id={file_storage_id}")
+        
+        # 使用 FileStorageManager 管理的视频路径
+        stored_path = file_storage_manager.get_file_path(file_storage_id)
+        if not stored_path or not os.path.exists(stored_path):
+            raise FileNotFoundError(f"FileStorageManager: Video file not found for file_id={file_storage_id}")
+        
+        video_path = Path(stored_path)
+        # working_dir 使用 FileStorageManager 的存储目录
+        working_dir = Path(file_storage_manager.storage_base_path) / "files" / "videos" / file_storage_id
         working_dir.mkdir(parents=True, exist_ok=True)
-
-        # Ensure the video file lives in the working_dir so later steps (e.g., segment captioning)
-        # can still access it after any temp upload directory is cleaned up.
-        target_path = working_dir / video_path.name
-        if video_path != target_path:
-            shutil.copyfile(video_path, target_path)
-            video_path = target_path
+        print(f"VideoConverter: Using FileStorageManager path for file_id={file_storage_id}")
 
         llm_config = kwargs.get("llm_config") or self.config.get("llm_config") or deepseek_bge_config
         videorag_params = {
@@ -67,6 +76,14 @@ class VideoConverter(MultimodalConverter):
             **kwargs.get("videorag_params", {}),
         }
         videorag = VideoRAG(llm=llm_config, **videorag_params)
+        
+        # 将 file_storage_manager 和 file_storage_id 存储到 config 中，供后续使用
+        if file_storage_manager and file_storage_id:
+            self.config["file_storage_manager"] = file_storage_manager
+            self.config["file_storage_id"] = file_storage_id
+            # 同时存储到 videorag 的 global_config 中，供 vdb_nanovectordb 使用
+            videorag.video_segment_feature_vdb.global_config["file_storage_manager"] = file_storage_manager
+            videorag.video_segment_feature_vdb.global_config["file_storage_id"] = file_storage_id
 
         self._report_progress(0.05, "准备视频处理流程")
         segments = self._ingest_video_with_progress(videorag, str(video_path))
@@ -212,6 +229,10 @@ class VideoConverter(MultimodalConverter):
         self._report_progress(0.08, "注册视频路径")
         loop.run_until_complete(videorag.video_path_db.upsert({video_name: video_path}))
 
+        # 获取 file_storage_manager 和 file_storage_id（如果可用）
+        file_storage_manager = self.config.get("file_storage_manager")
+        file_storage_id = self.config.get("file_storage_id")
+        
         self._report_progress(0.12, "切分视频 & 采样帧")
         segment_index2name, segment_times_info = split_video(
             video_path,
@@ -219,6 +240,8 @@ class VideoConverter(MultimodalConverter):
             videorag.video_segment_length,
             videorag.rough_num_frames_per_segment,
             videorag.audio_output_format,
+            file_storage_manager=file_storage_manager,
+            file_storage_id=file_storage_id,
         )
 
         self._report_progress(0.2, "执行语音识别")
@@ -244,6 +267,8 @@ class VideoConverter(MultimodalConverter):
                 segment_times_info,
                 error_queue,
                 videorag.video_output_format,
+                file_storage_manager,
+                file_storage_id,
             ),
         )
 

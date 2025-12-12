@@ -41,6 +41,7 @@ except ImportError:
     from updater import Updater
     from retriever import Retriever
     from multimodal import ConverterFactory
+    from multimodal.converter import ConversionChunk, ConversionOutput
     from multimodal.utils import guess_file_extension, guess_mime_type, compute_file_hash
 
 # Heat threshold for triggering profile/knowledge update from mid-term memory
@@ -63,6 +64,8 @@ class Memcontext:
                  embedding_model_name: str = "all-MiniLM-L6-v2",
                  embedding_model_kwargs: dict = None,
                  multimodal_config: dict = None,
+                 file_storage_manager=None,
+                 file_storage_base_path: str = None,
                  ):
         self.user_id = user_id
         self.assistant_id = assistant_id
@@ -71,6 +74,29 @@ class Memcontext:
         self.mid_term_similarity_threshold = mid_term_similarity_threshold
         self.embedding_model_name = embedding_model_name
         self.multimodal_config = multimodal_config or {}
+        
+        # 初始化文件存储管理器
+        if file_storage_manager is None:
+            try:
+                from file_storage import FileStorageManager
+                # 如果未指定 file_storage_base_path，默认使用项目根目录（与 file_storage 和 memdemo 平齐）
+                if file_storage_base_path is None:
+                    # 获取当前文件所在目录（memcontext-playground），作为项目根目录
+                    current_file_dir = os.path.dirname(os.path.abspath(__file__))
+                    file_storage_base_path = current_file_dir
+                else:
+                    file_storage_base_path = os.path.abspath(file_storage_base_path)
+                
+                self.file_storage_manager = FileStorageManager(
+                    storage_base_path=file_storage_base_path,
+                    user_id=user_id
+                )
+                print(f"FileStorageManager initialized at: {file_storage_base_path}")
+            except ImportError:
+                print("Warning: file_storage module not found, file storage features will be disabled")
+                self.file_storage_manager = None
+        else:
+            self.file_storage_manager = file_storage_manager
         
         # Smart defaults for embedding_model_kwargs
         if embedding_model_kwargs is None:
@@ -480,18 +506,28 @@ class Memcontext:
 
         # 3. Format retrieved mid-term pages (retrieval_queue equivalent)
         # 提取查询中提到的视频信息（如果有），用于过滤结果
-        query_video_path = None
-        if '视频' in query:
+        query_video_id = None
+        if '描述' in query and '的' in query:
+            import re
+            # 尝试从查询中提取视频ID（格式：描述{视频id}的{time_range}）
+            video_match = re.search(r'描述(.+?)的', query)
+            if video_match:
+                query_video_id = video_match.group(1)
+        
+        # 兼容旧格式：尝试提取视频路径或名称
+        if not query_video_id and '视频' in query:
             import re
             # 尝试从查询中提取视频路径或名称
-            video_match = re.search(r'["\']?([^"\']+\.(mp4|avi|mov|mkv))["\']?', query)
+            video_match = re.search(r'["\']?([^"\']+\.(mp4|avi|mov|mkv|webm))["\']?', query)
             if video_match:
-                query_video_path = video_match.group(1)
+                query_video_id = video_match.group(1)
             else:
                 # 尝试提取"xxx视频"格式
                 video_match = re.search(r'([^\s]+)视频', query)
                 if video_match:
-                    query_video_path = video_match.group(1)
+                    query_video_id = video_match.group(1)
+        
+        query_video_path = query_video_id  # 为了兼容性，使用同一个变量
         
         retrieval_text_parts = []
         for page in retrieved_pages:
@@ -503,34 +539,60 @@ class Memcontext:
             except (AttributeError, TypeError):
                 page_meta = {}
             
-            page_video_path = None
-            
-            # 从 user_input 中提取视频路径（格式：描述{video_path}视频的{time_range}的内容）
+            # 从 user_input 中提取视频ID（格式：描述{视频id}的{time_range}）
             user_input = page.get('user_input', '')
-            if '视频' in user_input and '描述' in user_input:
+            page_video_id = None
+            page_video_path = None  # 用于兼容旧数据
+            
+            if '描述' in user_input and '的' in user_input:
                 import re
                 try:
-                    match = re.search(r'描述(.+?)视频的', user_input)
+                    # 匹配格式：描述{视频id}的{time_range}
+                    match = re.search(r'描述(.+?)的', user_input)
                     if match:
-                        page_video_path = match.group(1)
+                        page_video_id = match.group(1)
                 except Exception as e:
-                    print(f"Memorycontext: Error extracting video_path from user_input: {e}")
+                    print(f"Memorycontext: Error extracting video_id from user_input: {e}")
             
             # 如果从 user_input 中提取失败，尝试从 meta_data 中获取（使用 .get() 安全访问）
-            if not page_video_path:
+            if not page_video_id:
+                page_video_id = page_meta.get('file_storage_id') or page_meta.get('source_file_id')
+            
+            # 为了兼容性，也尝试获取 video_path（用于旧数据）
+            if not page_video_id:
+                page_video_path = page_meta.get('video_path') or page_meta.get('video_name')
+                if page_video_path:
+                    page_video_id = page_video_path  # 使用 video_path 作为 fallback
+            else:
+                # 如果有 video_id，也尝试获取 video_path 用于显示
                 page_video_path = page_meta.get('video_path') or page_meta.get('video_name')
             
             # 如果查询中指定了视频，只返回匹配的视频内容
-            if query_video_path and page_video_path:
-                try:
-                    if query_video_path not in page_video_path and page_video_path not in query_video_path:
-                        continue  # 跳过不匹配的视频
-                except TypeError:
-                    # 如果 page_video_path 不是字符串，跳过比较
-                    pass
+            if query_video_path:
+                # 检查是否匹配（支持 video_id 或 video_path 匹配）
+                matched = False
+                if page_video_id:
+                    try:
+                        if query_video_path in str(page_video_id) or str(page_video_id) in query_video_path:
+                            matched = True
+                    except TypeError:
+                        pass
+                elif page_video_path:
+                    # 回退到 video_path 匹配（兼容旧数据）
+                    try:
+                        if query_video_path in str(page_video_path) or str(page_video_path) in query_video_path:
+                            matched = True
+                    except TypeError:
+                        pass
+                
+                if not matched:
+                    continue  # 跳过不匹配的视频
             
             page_text = f"【Historical Memory】\nUser: {page.get('user_input', '')}\nAssistant: {page.get('agent_response', '')}\nTime: {page.get('timestamp', '')}\nConversation chain overview: {page.get('meta_info','N/A')}"
-            if page_video_path:
+            # 显示视频ID或路径（优先显示ID）
+            if page_video_id:
+                page_text += f"\n[Video Source: {page_video_id}]"
+            elif page_video_path:
                 page_text += f"\n[Video Source: {page_video_path}]"
             retrieval_text_parts.append(page_text)
         
@@ -647,6 +709,10 @@ class Memcontext:
         converter_kwargs: Dict[str, Any],
         progress_callback,
     ):
+        # 确保 converter_kwargs 是字典
+        if converter_kwargs is None:
+            converter_kwargs = {}
+        
         file_path = Path(item) if source_type == "file_path" else None
         file_extension = (
             guess_file_extension(file_path.name) if file_path else converter_kwargs.get("file_extension")
@@ -669,10 +735,38 @@ class Memcontext:
 
         base_metadata = self._build_multimodal_metadata(item, source_type, file_path, file_extension, mime_type)
 
+        # --- 使用 FileStorageManager 管理文件（如果是视频文件） ---
+        stored_file_id = None
+        stored_file_path = None
+        if file_path and self.file_storage_manager:
+            try:
+                from file_storage import FileType
+                # 判断是否为视频文件
+                if file_extension in ['mp4', 'mov', 'avi', 'mkv', 'webm', 'flv', 'm4v']:
+                    # 上传到 FileStorageManager
+                    file_record = self.file_storage_manager.upload_file(
+                        file_path=str(file_path),
+                        file_type=FileType.VIDEO,
+                        metadata=base_metadata
+                    )
+                    stored_file_id = file_record.file_id
+                    stored_file_path = file_record.stored_path
+                    # 更新 base_metadata 中的路径信息
+                    base_metadata['file_storage_id'] = stored_file_id
+                    base_metadata['stored_file_path'] = stored_file_path
+                    # 使用存储路径作为后续处理的路径
+                    file_path = Path(stored_file_path)
+                    # 将 file_storage_manager 和 file_storage_id 传递给 converter
+                    converter_kwargs['file_storage_manager'] = self.file_storage_manager
+                    converter_kwargs['file_storage_id'] = stored_file_id
+                    print(f"FileStorageManager: Video uploaded with file_id={stored_file_id}")
+            except Exception as e:
+                print(f"FileStorageManager: Failed to upload file, using original path. Error: {e}")
+
         # --- Temp cache: avoid重复解析同一文件 ---
         cache_dir = Path(self.data_storage_path) / "temp_memory"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        file_id = base_metadata.get("source_file_id")
+        file_id = base_metadata.get("source_file_id") or stored_file_id
         cache_file = cache_dir / f"{file_id}.json" if file_id else None
 
         output = None
@@ -705,9 +799,15 @@ class Memcontext:
                 output = None
 
         if output is None:
+            # 确保 converter_kwargs 中包含 file_storage_manager 和 file_storage_id（如果已上传）
+            if stored_file_id and self.file_storage_manager:
+                converter_kwargs['file_storage_manager'] = self.file_storage_manager
+                converter_kwargs['file_storage_id'] = stored_file_id
+            
             output = converter.convert(
                 item,
                 source_type=source_type,
+                **converter_kwargs,
             )
             output.ensure_chunks()
             # 写入缓存，便于同一文件再次导入时直接复用
@@ -757,26 +857,21 @@ class Memcontext:
                 )
             
             # 对于视频内容，构建格式化的 user_input
-            # 安全获取 video_path，确保不会为 None 或抛出 KeyError
+            # 使用 file_storage_id 而不是 video_path
             try:
-                video_path = chunk_meta.get("video_path") or chunk_meta.get("original_filename") or chunk_meta.get("video_name") or "视频"
+                # 优先使用 file_storage_id
+                video_id = chunk_meta.get("file_storage_id") or chunk_meta.get("source_file_id") or stored_file_id
                 time_range = chunk_meta.get("time_range", "")
                 
-                # 如果是视频内容（通过 video_path 或 time_range 判断）且有 time_range，使用新格式
-                if (chunk_meta.get("video_path") or chunk_meta.get("video_name")) and time_range:
-                    # 确保 video_path 是字符串且不为空
-                    if not isinstance(video_path, str) or not video_path or video_path == "视频":
-                        video_path = chunk_meta.get("video_name") or chunk_meta.get("original_filename") or "视频"
-                    if not isinstance(video_path, str):
-                        video_path = str(video_path) if video_path else "视频"
-                    user_input = f"描述{video_path}视频的{time_range}的内容"
+                # 如果是视频内容且有 time_range，使用新格式：描述{视频id}的{time_range}
+                if video_id and time_range:
+                    user_input = f"描述{video_id}的{time_range}"
                 else:
                     # 非视频内容或没有 time_range，使用原来的格式
                     user_input = chunk.text
             except Exception as e:
                 print(f"Memorycontext: Error building user_input: {e}, using chunk.text as fallback")
                 user_input = chunk.text
-                video_path = "视频"  # 设置默认值
             
             memories_to_add.append({
                 "user_input": user_input,

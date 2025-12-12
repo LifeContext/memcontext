@@ -17,6 +17,12 @@ try:  # noqa: F401
 except Exception:
     video_converter = None
 
+# VideoRAG converter依赖更多第三方组件（hnswlib/MiniCPM-V等），放在可选导入，避免阻塞无关场景。
+try:  # noqa: F401
+    from .converters import videorag_converter
+except Exception:
+    videorag_converter = None
+
 __all__ = [
     "MultimodalConverter",
     "ConversionChunk",

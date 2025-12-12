@@ -7,19 +7,34 @@ from moviepy.video import fx as vfx
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from .._utils import logger
 
+def _format_time_for_filename(seconds: float) -> str:
+    """将秒数格式化为文件名友好的格式"""
+    return f"{seconds:.2f}".replace('.', '_')
+
 def split_video(
     video_path,
     working_dir,
     segment_length,
     num_frames_per_segment,
     audio_output_format='mp3',
+    file_storage_manager=None,
+    file_storage_id=None,
 ):  
     unique_timestamp = str(int(time.time() * 1000))
     video_name = os.path.basename(video_path).split('.')[0]
-    video_segment_cache_path = os.path.join(working_dir, '_cache', video_name)
-    if os.path.exists(video_segment_cache_path):
-        shutil.rmtree(video_segment_cache_path)
-    os.makedirs(video_segment_cache_path, exist_ok=False)
+    
+    # 使用 FileStorageManager 的 segments/ 目录
+    if not file_storage_manager or not file_storage_id:
+        raise ValueError("file_storage_manager and file_storage_id are required")
+    
+    from file_storage import FileType
+    segments_dir = os.path.join(
+        file_storage_manager.storage_base_path,
+        'files', 'videos', file_storage_id, 'segments'
+    )
+    os.makedirs(segments_dir, exist_ok=True)
+    video_segment_cache_path = segments_dir
+    print(f"Using FileStorageManager segments directory: {segments_dir}")
     
     segment_index = 0
     segment_index2name, segment_times_info = {}, {}
@@ -66,13 +81,30 @@ def saving_video_segments(
     segment_times_info,
     error_queue,
     video_output_format='mp4',
+    file_storage_manager=None,
+    file_storage_id=None,
 ):
     try:
         with VideoFileClip(video_path) as video:
-            video_segment_cache_path = os.path.join(working_dir, '_cache', video_name)
+            # 使用 FileStorageManager 的 segments/ 目录
+            if not file_storage_manager or not file_storage_id:
+                raise ValueError("file_storage_manager and file_storage_id are required")
+            
+            from file_storage import FileType
+            segments_dir = os.path.join(
+                file_storage_manager.storage_base_path,
+                'files', 'videos', file_storage_id, 'segments'
+            )
+            os.makedirs(segments_dir, exist_ok=True)
+            video_segment_cache_path = segments_dir
+            print(f"Using FileStorageManager segments directory: {segments_dir}")
+            
             for index in tqdm(segment_index2name, desc=f"Saving Video Segments {video_name}"):
                 start, end = segment_times_info[index]["timestamp"][0], segment_times_info[index]["timestamp"][1]
-                video_file = f'{segment_index2name[index]}.{video_output_format}'
+                
+                # 使用标准命名格式：segment_{start}_{end}.mp4
+                video_file = f'segment_{_format_time_for_filename(start)}_{_format_time_for_filename(end)}.{video_output_format}'
+                
                 subvideo = video.subclip(start, end)
                 subvideo.write_videofile(os.path.join(video_segment_cache_path, video_file), codec='libx264', verbose=False, logger=None)
     except Exception as e:

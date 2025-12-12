@@ -105,7 +105,25 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
             logger.warning("You insert an empty data to vector DB")
             return []
         list_data, video_paths = [], []
-        cache_path = os.path.join(self.global_config["working_dir"], '_cache', video_name)
+        
+        # 使用 FileStorageManager 的 segments/ 目录
+        file_storage_manager = self.global_config.get("file_storage_manager")
+        file_storage_id = self.global_config.get("file_storage_id")
+        
+        if not file_storage_manager or not file_storage_id:
+            raise ValueError("file_storage_manager and file_storage_id are required in global_config")
+        
+        from file_storage import FileType
+        segments_dir = os.path.join(
+            file_storage_manager.storage_base_path,
+            'files', 'videos', file_storage_id, 'segments'
+        )
+        cache_path = segments_dir
+        logger.info(f"Using FileStorageManager segments directory: {segments_dir}")
+        
+        def _format_time_for_filename(seconds: float) -> str:
+            return f"{seconds:.2f}".replace('.', '_')
+        
         index_list = list(segment_index2name.keys())
         for index in index_list:
             list_data.append({
@@ -114,7 +132,16 @@ class NanoVectorDBVideoSegmentStorage(BaseVectorStorage):
                 "__index__": index,
             })
             segment_name = segment_index2name[index]
-            video_file = os.path.join(cache_path, f"{segment_name}.{video_output_format}")
+            
+            # 从 segment_index2name 中提取时间信息，格式：{timestamp}-{index}-{start}-{end}
+            parts = segment_name.split('-')
+            if len(parts) >= 4:
+                start_time = parts[-2]
+                end_time = parts[-1]
+                video_file = os.path.join(cache_path, f"segment_{_format_time_for_filename(float(start_time))}_{_format_time_for_filename(float(end_time))}.{video_output_format}")
+            else:
+                raise ValueError(f"Invalid segment_name format: {segment_name}")
+            
             video_paths.append(video_file)
         batches = [
             video_paths[i: i + self._max_batch_size]
