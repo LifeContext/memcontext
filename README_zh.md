@@ -56,7 +56,7 @@ ContextBase是**多模态原生 (Multi-modal Native)** 的记忆框架，旨在�
 ContextBase 借鉴了人类大脑的认知过程以及操作系统的存储结构，采用了分层存储架构配合双路检索引擎。
 
 <div align="center">
-  <img src="ContextBase_Workflow_v0.png" alt="ContextBase Architecture Workflow" width="100%">
+  <img src="assets/MemContext_Workflow_v0.png" alt="ContextBase Architecture Workflow" width="100%">
 </div>
 
 ### 🧠 记忆生命周期
@@ -111,7 +111,50 @@ ContextBase 借鉴了人类大脑的认知过程以及操作系统的存储结�
 
 ## ⚡ 快速开始
 
-*(代码库整理中，即将开放)*
+1) 环境  
+- Python 3.9+  
+- （可选）创建虚拟环境：`python -m venv .venv && source .venv/bin/activate`（PowerShell: `.\.venv\Scripts\Activate`）
+
+2) 安装依赖  
+```bash
+pip install -r requirements.txt
+```
+
+3) 配置密钥  
+```bash
+export OPENAI_API_KEY=你的密钥             # 必填
+export OPENAI_BASE_URL=https://api.openai.com/v1  # 可选，自定义网关时设置
+```
+
+4) 最小示例  
+```python
+from memcontext import Memcontext
+
+mem = Memcontext(
+    user_id="demo_user",
+    openai_api_key=os.environ["OPENAI_API_KEY"],
+    data_storage_path="./data",             # 数据持久化目录
+    openai_base_url=os.getenv("OPENAI_BASE_URL"),
+)
+
+# 添加一条对话记忆
+mem.add_memory(
+    user_input="我最近在学多模态 RAG",
+    agent_response="好的，我会记录你的学习偏好。",
+    meta_data={"source": "demo"}
+)
+
+# 检索上下文
+ctx = mem.retrieve_context(user_query="再帮我回顾下上次学的内容？")
+print(ctx)
+```
+
+5) 运行 Demo 界面（Flask）  
+```bash
+cd memdemo
+pip install -r requirements.txt
+python app.py    # 默认端口 5000
+```
 
 ## 🤝 贡献指南
 
