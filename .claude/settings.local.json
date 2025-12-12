@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree /d/myCode/python/work/memcontext/memcontext-playground/multimodal/ -L 3)",
+      "Bash(find:*)"
+    ]
+  }
+}
