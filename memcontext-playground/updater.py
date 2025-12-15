@@ -121,6 +121,20 @@ class Updater:
         temp_last_page_in_batch = self.last_evicted_page_for_continuity # Carry over from previous batch if any
 
         for qa_pair in evicted_qas:
+            # 原代码（已注释）：
+            # current_page_obj = {
+            #     "page_id": generate_id("page"),
+            #     "user_input": qa_pair.get("user_input", ""),
+            #     "agent_response": qa_pair.get("agent_response", ""),
+            #     "timestamp": qa_pair.get("timestamp", get_timestamp()),
+            #     "preloaded": False, # Default for new pages from short-term
+            #     "analyzed": False,  # Default for new pages from short-term
+            #     "pre_page": None,
+            #     "next_page": None,
+            #     "meta_info": None
+            # }
+            
+            # 新代码：保留 metadata 信息
             current_page_obj = {
                 "page_id": generate_id("page"),
                 "user_input": qa_pair.get("user_input", ""),
@@ -130,7 +144,8 @@ class Updater:
                 "analyzed": False,  # Default for new pages from short-term
                 "pre_page": None,
                 "next_page": None,
-                "meta_info": None
+                "meta_info": None,
+                "meta_data": qa_pair.get("meta_data", {}) or {}  # 保留 metadata 信息
             }
             
             is_continuous = check_conversation_continuity(temp_last_page_in_batch, current_page_obj, self.client, model=self.llm_model)

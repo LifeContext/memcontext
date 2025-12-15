@@ -142,6 +142,10 @@ def init_memory():
 def chat():
     data = request.json
     user_input = data.get('message', '')
+    #这里新加了补充metadata的功能(如果有metadata字段的话)
+    #    user_input = data.get('message', '')
+    user_conversation_meta_data = data.get('metadata', None)
+    relationship_with_user = data.get('relationship', 'friend')
     
     session_id = session.get('memory_session_id')
     if not session_id or session_id not in memory_systems:
@@ -150,8 +154,16 @@ def chat():
     memory_system = memory_systems[session_id]
     
     try:
+        # 原代码：
         # Get response from memcontext (this already adds the memory internally)
-        response = memory_system.get_response(user_input)
+        # response = memory_system.get_response(user_input)
+        
+        # 新代码：传递 metadata 和 relationship 参数
+        response = memory_system.get_response(
+            query=user_input,
+            relationship_with_user=relationship_with_user,
+            user_conversation_meta_data=user_conversation_meta_data
+        )
         
         # Do NOT add memory again here - it's already done in get_response()
         
@@ -259,10 +271,41 @@ def add_multimodal_memory_endpoint():
         conversations = []
         for chunk in video_result.chunks:
             chunk_meta = dict(chunk.metadata)
+            # 原代码：
+            # meta_data = {
+            #     'source_type': chunk_meta.get('source_type', 'file_path'),
+            #     'video_name': chunk_meta.get('video_name', ''),
+            #     'time_range': chunk_meta.get('time_range', ''),
+            # }
+            # 新代码：保存完整的 metadata 信息，包括所有有用的字段
+            # 统一生成 name 字段：文件名 + chunk_index
+            base_video_name = chunk_meta.get('video_name') or chunk_meta.get('original_filename', '')
+            chunk_idx = chunk_meta.get('chunk_index', 0)
+            if base_video_name:
+                name_field = f"{base_video_name}_chunk_{chunk_idx}"
+                # 避免重复附加 chunk_XX
+                if f"chunk_{chunk_idx}" in base_video_name:
+                    name_field = base_video_name
+            else:
+                name_field = f"video_chunk_{chunk_idx}"
+
             meta_data = {
                 'source_type': chunk_meta.get('source_type', 'file_path'),
                 'video_name': chunk_meta.get('video_name', ''),
+                'name': name_field,
                 'time_range': chunk_meta.get('time_range', ''),
+                # 内容分析字段
+                'chunk_summary': chunk_meta.get('chunk_summary', ''),
+                'scene_label': chunk_meta.get('scene_label', ''),
+                'objects_detected': chunk_meta.get('objects_detected', []),
+                'actions': chunk_meta.get('actions', ''),
+                'emotions': chunk_meta.get('emotions', ''),
+                # 技术字段
+                'duration_seconds': chunk_meta.get('duration_seconds', 0),
+                'chunk_index': chunk_meta.get('chunk_index', 0),
+                'chunk_count_estimate': chunk_meta.get('chunk_count_estimate', 0),
+                'language': chunk_meta.get('language', ''),
+                'confidence': chunk_meta.get('confidence', 0.75),
             }
 
             # 优先使用 chunk.text（完整内容），如果没有则使用 chunk_summary（摘要）

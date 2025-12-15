@@ -23,6 +23,11 @@ GENERATE_SYSTEM_RESPONSE_USER_PROMPT = (
     "{background}\n\n"
     "Now, please role-play as {relationship} to continue the dialogue between you and the user.\n"
     "The user just said: {query}\n"
+    "\n"
+    "IMPORTANT: If the Memory entries above contain 'Metadata' fields (such as video_name, name, time_range, chunk_index, objects_detected, scene_label, duration_seconds, etc.), "
+    "you MUST use these metadata fields directly to answer the user's question. Do NOT say 'I need more information' or 'Please provide context' if the metadata already contains the answer. "
+    "For example, if the user asks about a filename and the Metadata contains 'video_name' or 'name', use that value directly.\n"
+    "\n"
     "Please respond to the user's statement using the following format (maximum 30 words, must be in English):\n "
     "When answering questions, be sure to check whether the timestamp of the referenced information matches the timeframe of the question"
 )

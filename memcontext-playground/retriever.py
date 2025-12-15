@@ -42,6 +42,7 @@ class Retriever:
         )
         
         # Use a heap to get top N pages across all relevant sessions based on their scores
+        # Priority: pages with metadata get a boost
         top_pages_heap = []
         page_counter = 0  # Add counter to ensure unique comparison
         for session_match in matched_sessions:
@@ -49,9 +50,12 @@ class Retriever:
                 page_data = page_match["page_data"]
                 page_score = page_match["score"] # Using the page score directly
                 
-                # Add session relevance score to page score or combine them?
-                # For now, using page_score. Could be: page_score * session_match["session_relevance_score"]
-                combined_score = page_score # Potentially adjust with session_relevance_score
+                # Boost score for pages with metadata (prefer pages with metadata)
+                meta_data = page_data.get('meta_data', {}) or {}
+                has_metadata = bool(meta_data and len(meta_data) > 0)
+                metadata_boost = 0.1 if has_metadata else 0.0  # Small boost for metadata pages
+                
+                combined_score = page_score + metadata_boost
 
                 if len(top_pages_heap) < self.retrieval_queue_capacity:
                     heapq.heappush(top_pages_heap, (combined_score, page_counter, page_data))
@@ -63,7 +67,11 @@ class Retriever:
         
         # Extract pages from heap, already sorted by heapq property (smallest first)
         # We want highest scores, so either use a max-heap or sort after popping from min-heap.
-        retrieved_pages = [item[2] for item in sorted(top_pages_heap, key=lambda x: x[0], reverse=True)]
+        # Further prioritize: sort by metadata presence, then by score
+        retrieved_pages = [item[2] for item in sorted(top_pages_heap, key=lambda x: (
+            not bool(x[2].get('meta_data', {}) or {}),  # False (has metadata) comes before True (no metadata)
+            -x[0]  # Then by score (descending)
+        ))]
         print(f"Retriever: Mid-term memory recalled {len(retrieved_pages)} pages.")
         return retrieved_pages
 

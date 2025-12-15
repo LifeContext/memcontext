@@ -269,9 +269,80 @@ class Memcontext:
         # After any memory addition that might impact mid-term, check for profile updates
         self._trigger_profile_and_knowledge_update_if_needed()
 
+    def _needs_metadata(self, query: str) -> list:
+        """
+        方案 4：查询类型识别 - 判断查询是否需要 metadata，返回需要的字段列表
+        """
+        metadata_keywords = {
+            'video_name': ['文件名', 'filename', '视频名', '视频文件', 'video name'],
+            'name': ['片段名', '段名', 'name'],
+            'time_range': ['时间范围', 'time range', '时间段', '时间', 'time', 'range'],
+            'chunk_index': ['片段', 'chunk', 'segment', '第.*个片段', '片段编号', '片段数量'],
+            'objects_detected': ['对象', 'object', '物体', '检测', 'detect', '识别'],
+            'scene_label': ['场景', 'scene', '场景分类', '场景类型'],
+            'duration_seconds': ['时长', 'duration', '秒', 'seconds', '多长时间']
+        }
+        
+        query_lower = query.lower()
+        needed_fields = []
+        for field, keywords in metadata_keywords.items():
+            if any(kw in query_lower for kw in keywords):
+                needed_fields.append(field)
+        
+        return needed_fields
+    
+    def _filter_and_rank_by_metadata(self, retrieved_pages: list, needed_fields: list) -> list:
+        """
+        根据 metadata 字段过滤和排序检索结果，优先返回包含所需字段的页面
+        """
+        if not retrieved_pages:
+            return retrieved_pages
+        
+        # 如果没有指定需要的字段，仍然优先返回有 metadata 的页面
+        if not needed_fields:
+            pages_with_metadata = []
+            pages_without_metadata = []
+            for page in retrieved_pages:
+                meta_data = page.get('meta_data', {}) or {}
+                if meta_data and len(meta_data) > 0:
+                    pages_with_metadata.append(page)
+                else:
+                    pages_without_metadata.append(page)
+            return pages_with_metadata + pages_without_metadata
+        
+        # 分离有 metadata 和没有 metadata 的页面
+        pages_with_needed_metadata = []  # 包含所需字段的页面
+        pages_with_other_metadata = []   # 有其他metadata但没有所需字段的页面
+        pages_without_metadata = []      # 完全没有metadata的页面
+        
+        for page in retrieved_pages:
+            meta_data = page.get('meta_data', {}) or {}
+            if meta_data and len(meta_data) > 0:
+                # 检查是否包含需要的字段
+                has_needed_fields = any(
+                    meta_data.get(field) not in [None, '', [], {}] 
+                    for field in needed_fields
+                )
+                if has_needed_fields:
+                    pages_with_needed_metadata.append(page)
+                else:
+                    pages_with_other_metadata.append(page)
+            else:
+                pages_without_metadata.append(page)
+        
+        # 优先返回包含所需 metadata 的页面
+        return pages_with_needed_metadata + pages_with_other_metadata + pages_without_metadata
+    
+
     def get_response(self, query: str, relationship_with_user="friend", style_hint="", user_conversation_meta_data: dict = None) -> str:
         """
         Generates a response to the user's query, incorporating memory and context.
+        
+        Args:
+            query: 用户查询
+            relationship_with_user: 与用户的关系
+            style_hint: 风格提示
+            user_conversation_meta_data: 当前对话的 metadata
         """
         print(f"Memorycontext: Generating response for query: '{query[:50]}...'")
 
@@ -279,11 +350,16 @@ class Memcontext:
         retrieval_results = self.retriever.retrieve_context(
             user_query=query,
             user_id=self.user_id
-            # Using default thresholds from Retriever class for now
         )
         retrieved_pages = retrieval_results["retrieved_pages"]
         retrieved_user_knowledge = retrieval_results["retrieved_user_knowledge"]
         retrieved_assistant_knowledge = retrieval_results["retrieved_assistant_knowledge"]
+        
+        # 1.1 识别需要的 metadata 字段并重新排序检索结果
+        needed_metadata_fields = self._needs_metadata(query)
+        retrieved_pages = self._filter_and_rank_by_metadata(retrieved_pages, needed_metadata_fields)
+        if needed_metadata_fields:
+            print(f"Memorycontext: Query needs metadata fields: {needed_metadata_fields}, re-ranked {len(retrieved_pages)} pages")
 
         # 2. Get short-term history
         short_term_history = self.short_term_memory.get_all()
@@ -293,8 +369,33 @@ class Memcontext:
         ])
 
         # 3. Format retrieved mid-term pages (retrieval_queue equivalent)
+        def _format_meta(meta_obj):
+            if not meta_obj or not isinstance(meta_obj, dict) or len(meta_obj) == 0:
+                return "None"
+            try:
+                # 格式化 metadata，突出关键字段
+                formatted = []
+                key_fields = ['name', 'video_name', 'time_range', 'chunk_index', 'objects_detected', 'scene_label', 'duration_seconds']
+                for key in key_fields:
+                    if key in meta_obj and meta_obj[key]:
+                        formatted.append(f"  {key}: {meta_obj[key]}")
+                # 添加其他字段
+                for key, value in meta_obj.items():
+                    if key not in key_fields and value:
+                        formatted.append(f"  {key}: {value}")
+                if formatted:
+                    return "\n" + "\n".join(formatted)
+                return "None"
+            except TypeError:
+                return str(meta_obj)
+
         retrieval_text = "\n".join([
-            f"【Historical Memory】\nUser: {page.get('user_input', '')}\nAssistant: {page.get('agent_response', '')}\nTime: {page.get('timestamp', '')}\nConversation chain overview: {page.get('meta_info','N/A')}"
+            f"【Historical Memory】\n"
+            f"User: {page.get('user_input', '')}\n"
+            f"Assistant: {page.get('agent_response', '')}\n"
+            f"Time: {page.get('timestamp', '')}\n"
+            f"Conversation chain overview: {page.get('meta_info','N/A')}\n"
+            f"Metadata:{_format_meta(page.get('meta_data', {}) or {})}"
             for page in retrieved_pages
         ])
 
@@ -338,6 +439,7 @@ class Memcontext:
             meta_data_text=meta_data_text_for_prompt # Using meta_data_text placeholder for user_conversation_meta_data
         )
         
+        # 8. Construct Prompts
         user_prompt_text = prompts.GENERATE_SYSTEM_RESPONSE_USER_PROMPT.format(
             history_text=history_text,
             retrieval_text=retrieval_text,
@@ -361,8 +463,6 @@ class Memcontext:
             temperature=0.7, 
             max_tokens=1500 # As in original main
         )
-        
-        # 10. Add this interaction to memory
         self.add_memory(user_input=query, agent_response=response_content, timestamp=get_timestamp())
         
         return response_content
